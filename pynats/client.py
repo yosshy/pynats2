@@ -3,6 +3,7 @@ import json
 import re
 import socket
 import ssl
+import threading
 from dataclasses import dataclass
 from typing import Callable, Dict, Match, Optional, Pattern, Tuple, Union, cast
 from urllib.parse import urlparse
@@ -89,6 +90,8 @@ class NATSClient:
         "_ssid",
         "_subs",
         "_nuid",
+        "_read_lock",
+        "_send_lock",
     )
 
     def __init__(
@@ -134,6 +137,8 @@ class NATSClient:
         self._ssid = 0
         self._subs: Dict[int, NATSSubscription] = {}
         self._nuid = NUID()
+        self._read_lock = threading.RLock()
+        self._send_lock = threading.RLock()
 
     def __enter__(self) -> "NATSClient":
         self.connect()
@@ -207,8 +212,9 @@ class NATSClient:
         self.connect()
 
     def ping(self) -> None:
-        self._send(PING_OP)
-        self._recv(PONG_RE)
+        with self._read_lock:
+            self._send(PING_OP)
+            self._recv(PONG_RE)
 
     def subscribe(
         self,
@@ -266,15 +272,16 @@ class NATSClient:
     def wait(self, *, count=None) -> None:
         total = 0
         while True:
-            command, result = self._recv(MSG_RE, PING_RE, OK_RE)
-            if command is MSG_RE:
-                self._handle_message(result)
+            with self._read_lock:
+                command, result = self._recv(MSG_RE, PING_RE, OK_RE)
+                if command is MSG_RE:
+                    self._handle_message(result)
 
-                total += 1
-                if count is not None and total >= count:
-                    break
-            elif command is PING_RE:
-                self._send(PONG_OP)
+                    total += 1
+                    if count is not None and total >= count:
+                        break
+                elif command is PING_RE:
+                    self._send(PONG_OP)
 
     def _send_connect_command(self) -> None:
         options = {
@@ -295,7 +302,8 @@ class NATSClient:
         self._send(CONNECT_OP, json.dumps(options))
 
     def _send(self, *parts: Union[bytes, str, int]) -> None:
-        self._socket.sendall(_SPC_.join(self._encode(p) for p in parts) + _CRLF_)
+        with self._send_lock:
+            self._socket.sendall(_SPC_.join(self._encode(p) for p in parts) + _CRLF_)
 
     def _encode(self, value: Union[bytes, str, int]) -> bytes:
         if isinstance(value, bytes):
