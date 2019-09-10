@@ -1,3 +1,4 @@
+import collections
 import os
 import socket
 import threading
@@ -116,6 +117,49 @@ def test_publish(nats_url):
     assert received[1].subject == "test-subject"
     assert received[1].reply == ""
     assert received[1].payload == b"test-payload"
+
+
+def test_publish_with_waiter(nats_url):
+    received = []
+    event = threading.Event()
+
+    def worker():
+        with NATSClient(nats_url, socket_timeout=2, auto_wait=True) as client:
+
+            def callback(message):
+                received.append(message)
+
+            client.subscribe(
+                "test-subject", callback=callback, queue="test-queue", max_messages=2
+            )
+
+            event.wait()
+
+    t = threading.Thread(target=worker)
+    t.start()
+
+    time.sleep(1)
+
+    with NATSClient(nats_url, socket_timeout=2) as client:
+        # publish without payload
+        client.publish("test-subject")
+        # publish with payload
+        client.publish("test-subject", payload=b"test-payload")
+
+    time.sleep(1)
+    event.set()
+    t.join()
+
+    assert len(received) == 2
+
+    assert received[0].subject == "test-subject"
+    assert received[0].reply == ""
+    assert received[0].payload == b""
+
+    assert received[1].subject == "test-subject"
+    assert received[1].reply == ""
+    assert received[1].payload == b"test-payload"
+
 
 
 def test_request(nats_url):

@@ -92,6 +92,9 @@ class NATSClient:
         "_nuid",
         "_read_lock",
         "_send_lock",
+        "_auto_wait",
+        "_wait_thread",
+        "_wait_thread_enabled",
     )
 
     def __init__(
@@ -107,6 +110,7 @@ class NATSClient:
         tls_verify: bool = False,
         socket_timeout: float = None,
         socket_keepalive: bool = False,
+        auto_wait: bool = False,
     ) -> None:
         parsed = urlparse(url)
         self._conn_options = {
@@ -139,6 +143,9 @@ class NATSClient:
         self._nuid = NUID()
         self._read_lock = threading.RLock()
         self._send_lock = threading.RLock()
+        self._auto_wait = auto_wait
+        self._wait_thread_enabled: bool = False
+        self._wait_thread: Optional[threading.Thread] = None
 
     def __enter__(self) -> "NATSClient":
         self.connect()
@@ -203,7 +210,18 @@ class NATSClient:
         else:
             raise NATSInvalidSchemeError(f"got unsupported URI scheme: {scheme}")
 
+        if self._auto_wait:
+            self._wait_thread = threading.Thread(target=self._waiter)
+            self._wait_thread_enabled = True
+            self._wait_thread.start()
+
     def close(self) -> None:
+        if self._wait_thread_enabled:
+            self._wait_thread_enabled = False
+        if self._wait_thread is not None:
+            self._wait_thread.join()
+            self._wait_thread = None
+
         self._socket_file.close()
         self._socket.close()
 
@@ -265,7 +283,8 @@ class NATSClient:
         sub = self.subscribe(reply_subject, callback=callback, max_messages=1)
         self.auto_unsubscribe(sub)
         self.publish(subject, payload=payload, reply=reply_subject)
-        self.wait(count=1)
+        if not self._wait_thread_enabled:
+            self.wait(count=1)
 
         return reply_messages[sub.sid]
 
@@ -280,6 +299,15 @@ class NATSClient:
                     total += 1
                     if count is not None and total >= count:
                         break
+                elif command is PING_RE:
+                    self._send(PONG_OP)
+
+    def _waiter(self):
+        while self._wait_thread_enabled:
+            with self._read_lock:
+                command, result = self._recv(MSG_RE, PING_RE, OK_RE)
+                if command is MSG_RE:
+                    self._handle_message(result)
                 elif command is PING_RE:
                     self._send(PONG_OP)
 
