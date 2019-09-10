@@ -4,6 +4,7 @@ import re
 import socket
 import ssl
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Dict, Match, Optional, Pattern, Tuple, Union, cast
 from urllib.parse import urlparse
@@ -95,6 +96,7 @@ class NATSClient:
         "_auto_wait",
         "_wait_thread",
         "_wait_thread_enabled",
+        "_workers",
     )
 
     def __init__(
@@ -111,6 +113,7 @@ class NATSClient:
         socket_timeout: float = None,
         socket_keepalive: bool = False,
         auto_wait: bool = False,
+        workers: int = 3,
     ) -> None:
         parsed = urlparse(url)
         self._conn_options = {
@@ -146,6 +149,8 @@ class NATSClient:
         self._auto_wait = auto_wait
         self._wait_thread_enabled: bool = False
         self._wait_thread: Optional[threading.Thread] = None
+        self._workers = ThreadPoolExecutor(max_workers=workers,
+                                           thread_name_prefix="worker")
 
     def __enter__(self) -> "NATSClient":
         self.connect()
@@ -216,6 +221,7 @@ class NATSClient:
             self._wait_thread.start()
 
     def close(self) -> None:
+        self._workers.shutdown()
         if self._wait_thread_enabled:
             self._wait_thread_enabled = False
         if self._wait_thread is not None:
@@ -399,4 +405,4 @@ class NATSClient:
         if sub.is_wasted():
             self._subs.pop(sub.sid)
 
-        sub.callback(message)
+        self._workers.submit(sub.callback, message)

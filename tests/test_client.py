@@ -121,13 +121,16 @@ def test_publish(nats_url):
 
 def test_publish_with_waiter(nats_url):
     received = []
+    received_at = []
     event = threading.Event()
 
     def worker():
-        with NATSClient(nats_url, socket_timeout=2, auto_wait=True) as client:
+        with NATSClient(nats_url, socket_timeout=4, auto_wait=True) as client:
 
             def callback(message):
                 received.append(message)
+                received_at.append(time.monotonic())
+                time.sleep(1)
 
             client.subscribe(
                 "test-subject", callback=callback, queue="test-queue", max_messages=2
@@ -160,7 +163,8 @@ def test_publish_with_waiter(nats_url):
     assert received[1].reply == ""
     assert received[1].payload == b"test-payload"
 
-
+    assert len(received_at) == 2
+    assert received_at[1] - received_at[0] < 0.1
 
 def test_request(nats_url):
     def worker():
