@@ -28,6 +28,13 @@ def test_connect_and_close_using_context_manager(nats_url):
         client.ping()
 
 
+def test_connect_and_close_with_auto_ping(nats_url):
+    with NATSClient(nats_url, socket_timeout=4, auto_ping_interval=1) as client:
+         time.sleep(4)
+
+    assert 1 == 0
+
+
 def test_connect_timeout():
     client = NATSClient("nats://127.0.0.1:4223", socket_timeout=2)
 

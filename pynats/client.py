@@ -4,6 +4,7 @@ import re
 import socket
 import ssl
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Dict, Match, Optional, Pattern, Tuple, Union, cast
@@ -94,8 +95,11 @@ class NATSClient:
         "_read_lock",
         "_send_lock",
         "_auto_wait",
+        "_auto_ping_interval",
         "_wait_thread",
         "_wait_thread_enabled",
+        "_ping_thread",
+        "_ping_thread_enabled",
         "_workers",
     )
 
@@ -113,6 +117,7 @@ class NATSClient:
         socket_timeout: float = None,
         socket_keepalive: bool = False,
         auto_wait: bool = False,
+        auto_ping_interval: int = 0,
         workers: int = 3,
     ) -> None:
         parsed = urlparse(url)
@@ -149,6 +154,9 @@ class NATSClient:
         self._auto_wait = auto_wait
         self._wait_thread_enabled: bool = False
         self._wait_thread: Optional[threading.Thread] = None
+        self._auto_ping_interval = auto_ping_interval
+        self._ping_thread_enabled: bool = False
+        self._ping_thread: Optional[threading.Thread] = None
         self._workers = ThreadPoolExecutor(max_workers=workers,
                                            thread_name_prefix="worker")
 
@@ -220,13 +228,25 @@ class NATSClient:
             self._wait_thread_enabled = True
             self._wait_thread.start()
 
+        if self._auto_ping_interval > 0:
+            self._ping_thread = threading.Thread(target=self._pinger)
+            self._ping_thread_enabled = True
+            self._ping_thread.start()
+
     def close(self) -> None:
         self._workers.shutdown()
+
         if self._wait_thread_enabled:
             self._wait_thread_enabled = False
         if self._wait_thread is not None:
             self._wait_thread.join()
             self._wait_thread = None
+
+        if self._ping_thread_enabled:
+            self._ping_thread_enabled = False
+        if self._ping_thread is not None:
+            self._ping_thread.join()
+            self._ping_thread = None
 
         self._socket_file.close()
         self._socket.close()
@@ -234,6 +254,11 @@ class NATSClient:
     def reconnect(self) -> None:
         self.close()
         self.connect()
+
+    def _pinger(self) -> None:
+        while self._ping_thread_enabled:
+            self.ping()
+            time.sleep(self._auto_ping_interval)
 
     def ping(self) -> None:
         with self._read_lock:
