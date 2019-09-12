@@ -1,20 +1,22 @@
-import io
 import json
+import logging
+import pkg_resources
+import queue
 import re
 import socket
 import ssl
-import threading
-import time
+
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Callable, Dict, Match, Optional, Pattern, Tuple, Union, cast
+from threading import Thread, RLock
+from typing import Callable, Dict, Match, Optional, Pattern, Tuple, Union
 from urllib.parse import urlparse
 
-import pkg_resources
-
 from pynats.exceptions import (
+    NATSConnectionError,
     NATSInvalidResponse,
     NATSInvalidSchemeError,
+    NATSRequestTimeoutError,
     NATSTCPConnectionRequiredError,
     NATSTLSConnectionRequiredError,
     NATSUnexpectedResponse,
@@ -23,6 +25,7 @@ from pynats.nuid import NUID
 
 __all__ = ("NATSSubscription", "NATSMessage", "NATSClient")
 
+LOG = logging.getLogger(__name__)
 
 INFO_OP = b"INFO"
 CONNECT_OP = b"CONNECT"
@@ -34,6 +37,11 @@ PUB_OP = b"PUB"
 MSG_OP = b"MSG"
 OK_OP = b"+OK"
 ERR_OP = b"-ERR"
+
+DEFAULT_PING_INTERVAL = 30.0
+DEFAULT_REQUEST_TIMEOUT = 120.0
+DEFAULT_SOCKET_TIMEOUT = 1.0
+DEFAULT_WORKERS = 3
 
 INFO_RE = re.compile(rb"^INFO\s+([^\r\n]+)\r\n")
 PING_RE = re.compile(rb"^PING\r\n")
@@ -57,6 +65,16 @@ COMMANDS = {
 }
 
 INBOX_PREFIX = bytearray(b"_INBOX.")
+
+
+def log_exception(func):
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            LOG.error(str(e))
+
+    return wrapper
 
 
 @dataclass
@@ -87,19 +105,18 @@ class NATSClient:
     __slots__ = (
         "_conn_options",
         "_socket",
-        "_socket_file",
+        "_socket_buffer",
         "_socket_options",
+        "_subs_queue",
+        "_send_lock",
         "_ssid",
         "_subs",
         "_nuid",
-        "_read_lock",
-        "_send_lock",
-        "_auto_wait",
-        "_auto_ping_interval",
-        "_wait_thread",
-        "_wait_thread_enabled",
-        "_ping_thread",
-        "_ping_thread_enabled",
+        "_ping_interval",
+        "_waiter",
+        "_waiter_enabled",
+        "_pinger",
+        "_pinger_timer",
         "_workers",
     )
 
@@ -114,11 +131,10 @@ class NATSClient:
         tls_client_cert: Optional[str] = None,
         tls_client_key: Optional[str] = None,
         tls_verify: bool = False,
-        socket_timeout: float = None,
+        socket_timeout: float = DEFAULT_SOCKET_TIMEOUT,
         socket_keepalive: bool = False,
-        auto_wait: bool = False,
-        auto_ping_interval: int = 0,
-        workers: int = 3,
+        ping_interval: float = DEFAULT_PING_INTERVAL,
+        workers: int = DEFAULT_WORKERS,
     ) -> None:
         parsed = urlparse(url)
         self._conn_options = {
@@ -140,7 +156,7 @@ class NATSClient:
         }
 
         self._socket: socket.socket
-        self._socket_file: io.TextIOWrapper
+        self._socket_buffer: bytes = b""
         self._socket_options = {
             "timeout": socket_timeout,
             "keepalive": socket_keepalive,
@@ -148,17 +164,17 @@ class NATSClient:
 
         self._ssid = 0
         self._subs: Dict[int, NATSSubscription] = {}
+        self._subs_queue: queue.Queue = queue.Queue()
+        self._send_lock: RLock = RLock()
         self._nuid = NUID()
-        self._read_lock = threading.RLock()
-        self._send_lock = threading.RLock()
-        self._auto_wait = auto_wait
-        self._wait_thread_enabled: bool = False
-        self._wait_thread: Optional[threading.Thread] = None
-        self._auto_ping_interval = auto_ping_interval
-        self._ping_thread_enabled: bool = False
-        self._ping_thread: Optional[threading.Thread] = None
-        self._workers = ThreadPoolExecutor(max_workers=workers,
-                                           thread_name_prefix="worker")
+        self._waiter: Optional[Thread] = None
+        self._waiter_enabled: bool = False
+        self._pinger: Optional[Thread] = None
+        self._pinger_timer: RLock = RLock()
+        self._ping_interval = ping_interval
+        self._workers = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="worker"
+        )
 
     def __enter__(self) -> "NATSClient":
         self.connect()
@@ -167,15 +183,37 @@ class NATSClient:
     def __exit__(self, type_, value, traceback) -> None:
         self.close()
 
+    def _send_connect_command(self) -> None:
+        options = {
+            "name": self._conn_options["name"],
+            "lang": self._conn_options["lang"],
+            "protocol": self._conn_options["protocol"],
+            "version": self._conn_options["version"],
+            "verbose": self._conn_options["verbose"],
+            "pedantic": self._conn_options["pedantic"],
+        }
+
+        if self._conn_options["username"] and self._conn_options["password"]:
+            options["user"] = self._conn_options["username"]
+            options["pass"] = self._conn_options["password"]
+        elif self._conn_options["username"]:
+            options["auth_token"] = self._conn_options["username"]
+
+        self._send(CONNECT_OP, json.dumps(options))
+
     def _connect_tcp(self) -> None:
         self._send_connect_command()
         _command, result = self._recv(INFO_RE)
+        if result is None:
+            raise NATSConnectionError("connection failed")
         server_info = json.loads(result.group(1))
         if server_info.get("tls_required", False):
             raise NATSTLSConnectionRequiredError("server enabled TLS connection")
 
     def _connect_tls(self) -> None:
         _command, result = self._recv(INFO_RE)
+        if result is None:
+            raise NATSConnectionError("connection failed")
         server_info = json.loads(result.group(1))
         if not server_info.get("tls_required", False):
             raise NATSTCPConnectionRequiredError("server disabled TLS connection")
@@ -198,7 +236,6 @@ class NATSClient:
 
         hostname = str(self._conn_options["hostname"])
         self._socket = ctx.wrap_socket(self._socket, server_hostname=hostname)
-        self._socket_file = self._socket.makefile("rb")
         self._send_connect_command()
         self._recv(OK_RE)
 
@@ -212,7 +249,6 @@ class NATSClient:
         sock.settimeout(self._socket_options["timeout"])
         sock.connect((self._conn_options["hostname"], self._conn_options["port"]))
 
-        self._socket_file = sock.makefile("rb")
         self._socket = sock
 
         scheme = self._conn_options["scheme"]
@@ -223,47 +259,54 @@ class NATSClient:
         else:
             raise NATSInvalidSchemeError(f"got unsupported URI scheme: {scheme}")
 
-        if self._auto_wait:
-            self._wait_thread = threading.Thread(target=self._waiter)
-            self._wait_thread_enabled = True
-            self._wait_thread.start()
-
-        if self._auto_ping_interval > 0:
-            self._ping_thread = threading.Thread(target=self._pinger)
-            self._ping_thread_enabled = True
-            self._ping_thread.start()
+        self._start_waiter()
+        self._start_pinger()
 
     def close(self) -> None:
         self._workers.shutdown()
+        self._stop_waiter()
+        self._stop_pinger()
 
-        if self._wait_thread_enabled:
-            self._wait_thread_enabled = False
-        if self._wait_thread is not None:
-            self._wait_thread.join()
-            self._wait_thread = None
-
-        if self._ping_thread_enabled:
-            self._ping_thread_enabled = False
-        if self._ping_thread is not None:
-            self._ping_thread.join()
-            self._ping_thread = None
-
-        self._socket_file.close()
         self._socket.close()
+        self._socket_buffer = b""
+
+    def _start_waiter(self):
+        self._waiter = Thread(target=self._waiter_thread, args=(self._subs,))
+        self._waiter_enabled = True
+        self._waiter.start()
+
+    def _start_pinger(self):
+        self._pinger_timer.acquire()
+        self._pinger = Thread(target=self._pinger_thread)
+        self._pinger.start()
+
+    def _stop_waiter(self):
+        if self._waiter_enabled:
+            self._waiter_enabled = False
+        if self._waiter is not None:
+            self._waiter.join()
+            self._waiter = None
+
+    def _stop_pinger(self):
+        self._pinger_timer.release()
+        if self._pinger is not None:
+            self._pinger.join()
+            self._pinger = None
+
+    @log_exception
+    def _pinger_thread(self) -> None:
+        while not self._pinger_timer.acquire(timeout=self._ping_interval):
+            self._send(PING_OP)
+        self._pinger_timer.release()
 
     def reconnect(self) -> None:
         self.close()
         self.connect()
-
-    def _pinger(self) -> None:
-        while self._ping_thread_enabled:
-            self.ping()
-            time.sleep(self._auto_ping_interval)
+        for sub in self._subs.values():
+            self._send(SUB_OP, sub.subject, sub.queue, sub.sid)
 
     def ping(self) -> None:
-        with self._read_lock:
-            self._send(PING_OP)
-            self._recv(PONG_RE)
+        self._send(PING_OP)
 
     def subscribe(
         self,
@@ -285,11 +328,16 @@ class NATSClient:
         self._subs[sub.sid] = sub
         self._send(SUB_OP, sub.subject, sub.queue, sub.sid)
 
+        self._stop_waiter()
+        self._start_waiter()
+
         return sub
 
     def unsubscribe(self, sub: NATSSubscription) -> None:
+        self._subs.pop(sub.sid, None)
         self._send(UNSUB_OP, sub.sid)
-        self._subs.pop(sub.sid)
+        self._stop_waiter()
+        self._start_waiter()
 
     def auto_unsubscribe(self, sub: NATSSubscription) -> None:
         if sub.max_messages is None:
@@ -298,71 +346,50 @@ class NATSClient:
         self._send(UNSUB_OP, sub.sid, sub.max_messages)
 
     def publish(self, subject: str, *, payload: bytes = b"", reply: str = "") -> None:
-        self._send(PUB_OP, subject, reply, len(payload))
-        self._send(payload)
+        with self._send_lock:
+            self._send(PUB_OP, subject, reply, len(payload))
+            self._send(payload)
 
-    def request(self, subject: str, *, payload: bytes = b"") -> NATSMessage:
+    def request(
+        self,
+        subject: str,
+        *,
+        payload: bytes = b"",
+        timeout: float = DEFAULT_REQUEST_TIMEOUT,
+    ) -> NATSMessage:
         next_inbox = INBOX_PREFIX[:]
         next_inbox.extend(self._nuid.next_())
-
         reply_subject = next_inbox.decode()
-        reply_messages: Dict[int, NATSMessage] = {}
+        reply_queue: queue.Queue = queue.Queue()
 
         def callback(message: NATSMessage) -> None:
-            reply_messages[message.sid] = message
+            reply_queue.put(message)
 
         sub = self.subscribe(reply_subject, callback=callback, max_messages=1)
-        self.auto_unsubscribe(sub)
         self.publish(subject, payload=payload, reply=reply_subject)
-        if not self._wait_thread_enabled:
-            self.wait(count=1)
 
-        return reply_messages[sub.sid]
-
-    def wait(self, *, count=None) -> None:
-        total = 0
-        while True:
-            with self._read_lock:
-                command, result = self._recv(MSG_RE, PING_RE, OK_RE)
-                if command is MSG_RE:
-                    self._handle_message(result)
-
-                    total += 1
-                    if count is not None and total >= count:
-                        break
-                elif command is PING_RE:
-                    self._send(PONG_OP)
-
-    def _waiter(self):
-        while self._wait_thread_enabled:
-            with self._read_lock:
-                command, result = self._recv(MSG_RE, PING_RE, OK_RE)
-                if command is MSG_RE:
-                    self._handle_message(result)
-                elif command is PING_RE:
-                    self._send(PONG_OP)
-
-    def _send_connect_command(self) -> None:
-        options = {
-            "name": self._conn_options["name"],
-            "lang": self._conn_options["lang"],
-            "protocol": self._conn_options["protocol"],
-            "version": self._conn_options["version"],
-            "verbose": self._conn_options["verbose"],
-            "pedantic": self._conn_options["pedantic"],
-        }
-
-        if self._conn_options["username"] and self._conn_options["password"]:
-            options["user"] = self._conn_options["username"]
-            options["pass"] = self._conn_options["password"]
-        elif self._conn_options["username"]:
-            options["auth_token"] = self._conn_options["username"]
-
-        self._send(CONNECT_OP, json.dumps(options))
+        try:
+            return reply_queue.get(timeout=timeout)
+        except queue.Empty:
+            raise NATSRequestTimeoutError()
+        finally:
+            self.unsubscribe(sub)
 
     def _send(self, *parts: Union[bytes, str, int]) -> None:
         with self._send_lock:
             self._socket.sendall(_SPC_.join(self._encode(p) for p in parts) + _CRLF_)
+
+    @log_exception
+    def _waiter_thread(self, subs):
+        self._subs = subs
+        while self._waiter_enabled:
+            command, result = self._recv(MSG_RE, PING_RE, PONG_RE, OK_RE)
+            if command is None:
+                continue
+            if command is MSG_RE:
+                self._handle_message(result)
+            elif command is PING_RE:
+                self._send(PONG_OP)
 
     def _encode(self, value: Union[bytes, str, int]) -> bytes:
         if isinstance(value, bytes):
@@ -374,8 +401,19 @@ class NATSClient:
 
         raise RuntimeError(f"got unsupported type for encoding: type={type(value)}")
 
-    def _recv(self, *commands: Pattern[bytes]) -> Tuple[Pattern[bytes], Match[bytes]]:
-        line = self._readline()
+    def _recv(
+        self, *commands: Pattern[bytes]
+    ) -> Union[Tuple[Pattern[bytes], Match[bytes]], Tuple[None, None]]:
+
+        try:
+            line = self._readline()
+        except socket.timeout:
+            return None, None
+        except ssl.SSLError:
+            return None, None
+        except socket.error as e:
+            LOG.error("_read:socket.error:%s", e)
+            return None, None
 
         command = self._get_command(line)
         if command not in commands:
@@ -388,19 +426,21 @@ class NATSClient:
         return command, result
 
     def _readline(self, *, size: int = None) -> bytes:
-        read = io.BytesIO()
+        result: bytes = b""
+        if size is None:
+            while _CRLF_ not in self._socket_buffer:
+                self._socket_buffer += self._socket.recv(128)
+            newline_pos = self._socket_buffer.index(_CRLF_) + len(_CRLF_)
+            result = self._socket_buffer[:newline_pos]
+            self._socket_buffer = self._socket_buffer[newline_pos:]
+        else:
+            to_recv_size = size + len(_CRLF_)
+            while len(self._socket_buffer) < to_recv_size:
+                self._socket_buffer += self._socket.recv(4096)
+            result = self._socket_buffer[:to_recv_size]
+            self._socket_buffer = self._socket_buffer[to_recv_size:]
 
-        while True:
-            line = cast(bytes, self._socket_file.readline())
-            read.write(line)
-
-            if size is not None:
-                if read.tell() == size + len(_CRLF_):
-                    break
-            elif line.endswith(_CRLF_):
-                break
-
-        return read.getvalue()
+        return result
 
     def _strip(self, line: bytes) -> bytes:
         return line[: -len(_CRLF_)]
@@ -428,6 +468,6 @@ class NATSClient:
         sub.received_messages += 1
 
         if sub.is_wasted():
-            self._subs.pop(sub.sid)
+            self._subs.pop(sub.sid, None)
 
         self._workers.submit(sub.callback, message)

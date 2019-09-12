@@ -6,6 +6,7 @@ __all__ = (
     "NATSTCPConnectionRequiredError",
     "NATSTLSConnectionRequiredError",
     "NATSUnexpectedResponse",
+    "NATSRequestTimeoutError",
 )
 
 
@@ -47,3 +48,7 @@ class NATSInvalidSchemeError(NATSConnectionError):
     def __init__(self, line: str, *args, **kwargs) -> None:
         self.line = line
         super().__init__(line, *args, **kwargs)
+
+
+class NATSRequestTimeoutError(NATSError):
+    pass

@@ -1,4 +1,3 @@
-import collections
 import os
 import socket
 import threading
@@ -7,7 +6,10 @@ import time
 import msgpack
 import pytest
 
-from pynats import NATSClient, NATSInvalidSchemeError
+from pynats import NATSClient, NATSInvalidSchemeError, NATSRequestTimeoutError
+
+
+event = threading.Event()
 
 
 @pytest.fixture
@@ -16,7 +18,7 @@ def nats_url():
 
 
 def test_connect_and_close(nats_url):
-    client = NATSClient(nats_url, socket_timeout=2)
+    client = NATSClient(nats_url)
 
     client.connect()
     client.ping()
@@ -24,26 +26,19 @@ def test_connect_and_close(nats_url):
 
 
 def test_connect_and_close_using_context_manager(nats_url):
-    with NATSClient(nats_url, socket_timeout=2) as client:
+    with NATSClient(nats_url) as client:
         client.ping()
 
 
-def test_connect_and_close_with_auto_ping(nats_url):
-    with NATSClient(nats_url, socket_timeout=4, auto_ping_interval=1) as client:
-         time.sleep(4)
-
-    assert 1 == 0
-
-
 def test_connect_timeout():
-    client = NATSClient("nats://127.0.0.1:4223", socket_timeout=2)
+    client = NATSClient("nats://127.0.0.1:4223")
 
     with pytest.raises(socket.error):
         client.connect()
 
 
 def test_reconnect(nats_url):
-    client = NATSClient(nats_url, socket_timeout=2)
+    client = NATSClient(nats_url)
 
     client.connect()
     client.ping()
@@ -59,6 +54,7 @@ def test_tls_connect():
 
     client.connect()
     client.ping()
+    client.close()
 
 
 def test_invalid_scheme():
@@ -69,22 +65,10 @@ def test_invalid_scheme():
 
 
 def test_subscribe_unsubscribe(nats_url):
-    with NATSClient(nats_url, socket_timeout=2) as client:
+    with NATSClient(nats_url) as client:
         sub = client.subscribe(
             "test-subject", callback=lambda x: x, queue="test-queue", max_messages=2
         )
-        client.unsubscribe(sub)
-
-
-def test_subscribe_timeout(nats_url):
-    with NATSClient(nats_url, socket_timeout=2) as client:
-        sub = client.subscribe(
-            "test-subject", callback=lambda x: x, queue="test-queue", max_messages=1
-        )
-
-        with pytest.raises(socket.timeout):
-            client.wait(count=1)
-
         client.unsubscribe(sub)
 
 
@@ -92,7 +76,7 @@ def test_publish(nats_url):
     received = []
 
     def worker():
-        with NATSClient(nats_url, socket_timeout=2) as client:
+        with NATSClient(nats_url) as client:
 
             def callback(message):
                 received.append(message)
@@ -100,49 +84,6 @@ def test_publish(nats_url):
             client.subscribe(
                 "test-subject", callback=callback, queue="test-queue", max_messages=2
             )
-            client.wait(count=2)
-
-    t = threading.Thread(target=worker)
-    t.start()
-
-    time.sleep(1)
-
-    with NATSClient(nats_url, socket_timeout=2) as client:
-        # publish without payload
-        client.publish("test-subject")
-        # publish with payload
-        client.publish("test-subject", payload=b"test-payload")
-
-    t.join()
-
-    assert len(received) == 2
-
-    assert received[0].subject == "test-subject"
-    assert received[0].reply == ""
-    assert received[0].payload == b""
-
-    assert received[1].subject == "test-subject"
-    assert received[1].reply == ""
-    assert received[1].payload == b"test-payload"
-
-
-def test_publish_with_waiter(nats_url):
-    received = []
-    received_at = []
-    event = threading.Event()
-
-    def worker():
-        with NATSClient(nats_url, socket_timeout=4, auto_wait=True) as client:
-
-            def callback(message):
-                received.append(message)
-                received_at.append(time.monotonic())
-                time.sleep(1)
-
-            client.subscribe(
-                "test-subject", callback=callback, queue="test-queue", max_messages=2
-            )
-
             event.wait()
 
     t = threading.Thread(target=worker)
@@ -150,14 +91,14 @@ def test_publish_with_waiter(nats_url):
 
     time.sleep(1)
 
-    with NATSClient(nats_url, socket_timeout=2) as client:
+    with NATSClient(nats_url) as client:
         # publish without payload
         client.publish("test-subject")
         # publish with payload
         client.publish("test-subject", payload=b"test-payload")
 
-    time.sleep(1)
     event.set()
+    event.clear()
     t.join()
 
     assert len(received) == 2
@@ -170,12 +111,10 @@ def test_publish_with_waiter(nats_url):
     assert received[1].reply == ""
     assert received[1].payload == b"test-payload"
 
-    assert len(received_at) == 2
-    assert received_at[1] - received_at[0] < 0.1
 
 def test_request(nats_url):
     def worker():
-        with NATSClient(nats_url, socket_timeout=2) as client:
+        with NATSClient(nats_url) as client:
 
             def callback(message):
                 client.publish(message.reply, payload=b"test-callback-payload")
@@ -183,14 +122,14 @@ def test_request(nats_url):
             client.subscribe(
                 "test-subject", callback=callback, queue="test-queue", max_messages=2
             )
-            client.wait(count=2)
+            event.wait()
 
     t = threading.Thread(target=worker)
     t.start()
 
     time.sleep(1)
 
-    with NATSClient(nats_url, socket_timeout=2) as client:
+    with NATSClient(nats_url) as client:
         # request without payload
         resp = client.request("test-subject")
         assert resp.subject.startswith("_INBOX.")
@@ -203,12 +142,14 @@ def test_request(nats_url):
         assert resp.reply == ""
         assert resp.payload == b"test-callback-payload"
 
+    event.set()
+    event.clear()
     t.join()
 
 
 def test_request_msgpack(nats_url):
     def worker():
-        with NATSClient(nats_url, socket_timeout=2) as client:
+        with NATSClient(nats_url) as client:
 
             def callback(message):
                 client.publish(
@@ -221,14 +162,14 @@ def test_request_msgpack(nats_url):
             client.subscribe(
                 "test-subject", callback=callback, queue="test-queue", max_messages=2
             )
-            client.wait(count=2)
+            event.wait()
 
     t = threading.Thread(target=worker)
     t.start()
 
     time.sleep(1)
 
-    with NATSClient(nats_url, socket_timeout=2) as client:
+    with NATSClient(nats_url) as client:
         # request without payload
         resp = client.request("test-subject")
         assert resp.subject.startswith("_INBOX.")
@@ -241,10 +182,12 @@ def test_request_msgpack(nats_url):
         assert resp.reply == ""
         assert msgpack.unpackb(resp.payload) == {b"v": 3338}
 
+    event.set()
+    event.clear()
     t.join()
 
 
 def test_request_timeout(nats_url):
-    with NATSClient(nats_url, socket_timeout=2) as client:
-        with pytest.raises(socket.timeout):
-            client.request("test-subject")
+    with NATSClient(nats_url) as client:
+        with pytest.raises(NATSRequestTimeoutError):
+            client.request("test-subject", timeout=2)
