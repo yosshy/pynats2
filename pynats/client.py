@@ -5,6 +5,7 @@ import queue
 import re
 import socket
 import ssl
+import time
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -73,6 +74,22 @@ def log_exception(func):
             return func(*args, **kwargs)
         except Exception as e:
             LOG.error(str(e))
+            time.sleep(1)
+
+    return wrapper
+
+
+def auto_reconnect(func):
+    def wrapper(self, *args, **kwargs):
+        print(self)
+        try:
+            return func(self, *args, **kwargs)
+        except (socket.error, ssl.SSLError, OSError) as e:
+            LOG.error(str(e))
+            if not self._conn_options["auto_reconnect"]:
+                raise e
+            self.reconnect()
+            return func(self, *args, **kwargs)
 
     return wrapper
 
@@ -134,6 +151,7 @@ class NATSClient:
         socket_timeout: float = DEFAULT_SOCKET_TIMEOUT,
         socket_keepalive: bool = False,
         ping_interval: float = DEFAULT_PING_INTERVAL,
+        auto_reconnect: bool = False,
         workers: int = DEFAULT_WORKERS,
     ) -> None:
         parsed = urlparse(url)
@@ -153,6 +171,7 @@ class NATSClient:
             "version": pkg_resources.get_distribution("nats-python").version,
             "verbose": verbose,
             "pedantic": pedantic,
+            "auto_reconnect": auto_reconnect,
         }
 
         self._socket: socket.socket
@@ -264,8 +283,8 @@ class NATSClient:
 
     def close(self) -> None:
         self._workers.shutdown()
-        self._stop_waiter()
         self._stop_pinger()
+        self._stop_waiter()
 
         self._socket.close()
         self._socket_buffer = b""
@@ -375,6 +394,7 @@ class NATSClient:
         finally:
             self.unsubscribe(sub)
 
+    @auto_reconnect
     def _send(self, *parts: Union[bytes, str, int]) -> None:
         with self._send_lock:
             self._socket.sendall(_SPC_.join(self._encode(p) for p in parts) + _CRLF_)
@@ -401,18 +421,14 @@ class NATSClient:
 
         raise RuntimeError(f"got unsupported type for encoding: type={type(value)}")
 
+    @auto_reconnect
     def _recv(
         self, *commands: Pattern[bytes]
     ) -> Union[Tuple[Pattern[bytes], Match[bytes]], Tuple[None, None]]:
 
         try:
             line = self._readline()
-        except socket.timeout:
-            return None, None
-        except ssl.SSLError:
-            return None, None
-        except socket.error as e:
-            LOG.error("_read:socket.error:%s", e)
+        except (socket.timeout, ssl.SSLWantReadError):
             return None, None
 
         command = self._get_command(line)
