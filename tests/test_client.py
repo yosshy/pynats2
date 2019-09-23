@@ -49,18 +49,6 @@ def test_reconnect(nats_url):
     client.close()
 
 
-def test_auto_reconnect(nats_url):
-    client = NATSClient(nats_url, auto_reconnect=True)
-
-    client.connect()
-    client.ping()
-
-    client._socket.close()
-    client.ping()
-
-    client.close()
-
-
 def test_tls_connect():
     client = NATSClient("tls://127.0.0.1:4224", verbose=True)
 
