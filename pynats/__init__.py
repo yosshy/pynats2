@@ -1,4 +1,4 @@
-from .client import NATSClient, NATSMessage, NATSSubscription
+from .client import NATSClient, NATSNoSubscribeClient, NATSMessage, NATSSubscription
 from .exceptions import (
     NATSConnectionError,
     NATSError,
@@ -17,6 +17,7 @@ __all__ = (
     "NATSInvalidResponse",
     "NATSInvalidSchemeError",
     "NATSMessage",
+    "NATSNoSubscribeClient",
     "NATSRequestTimeoutError",
     "NATSSubscription",
     "NATSTCPConnectionRequiredError",

@@ -5,10 +5,11 @@ import queue
 import re
 import socket
 import ssl
+from time import monotonic as now
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from threading import Thread, RLock
+from threading import Thread, RLock, Event
 from typing import Callable, Dict, Match, Optional, Pattern, Tuple, Union
 from urllib.parse import urlparse
 
@@ -23,7 +24,7 @@ from pynats.exceptions import (
 )
 from pynats.nuid import NUID
 
-__all__ = ("NATSSubscription", "NATSMessage", "NATSClient")
+__all__ = ("NATSSubscription", "NATSMessage", "NATSClient", "NATSNoSubscribeClient")
 
 LOG = logging.getLogger(__name__)
 
@@ -101,23 +102,19 @@ class NATSMessage:
     payload: bytes
 
 
-class NATSClient:
+class NATSNoSubscribeClient:
     __slots__ = (
         "_conn_options",
         "_socket",
         "_socket_buffer",
         "_socket_options",
         "_subs_queue",
-        "_send_lock",
         "_ssid",
         "_subs",
         "_nuid",
         "_ping_interval",
         "_waiter",
         "_waiter_enabled",
-        "_pinger",
-        "_pinger_timer",
-        "_workers",
     )
 
     def __init__(
@@ -134,7 +131,6 @@ class NATSClient:
         socket_timeout: float = DEFAULT_SOCKET_TIMEOUT,
         socket_keepalive: bool = False,
         ping_interval: float = DEFAULT_PING_INTERVAL,
-        workers: int = DEFAULT_WORKERS,
     ) -> None:
         parsed = urlparse(url)
         self._conn_options = {
@@ -163,20 +159,10 @@ class NATSClient:
         }
 
         self._ssid = 0
-        self._subs: Dict[int, NATSSubscription] = {}
-        self._subs_queue: queue.Queue = queue.Queue()
-        self._send_lock: RLock = RLock()
         self._nuid = NUID()
-        self._waiter: Optional[Thread] = None
-        self._waiter_enabled: bool = False
-        self._pinger: Optional[Thread] = None
-        self._pinger_timer: RLock = RLock()
         self._ping_interval = ping_interval
-        self._workers = ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="worker"
-        )
 
-    def __enter__(self) -> "NATSClient":
+    def __enter__(self) -> "NATSNoSubscribeClient":
         self.connect()
         return self
 
@@ -259,16 +245,226 @@ class NATSClient:
         else:
             raise NATSInvalidSchemeError(f"got unsupported URI scheme: {scheme}")
 
+    def close(self) -> None:
+        self._socket.close()
+        self._socket_buffer = b""
+
+    def reconnect(self) -> None:
+        self.close()
+        self.connect()
+
+    def ping(self) -> None:
+        self._send(PING_OP)
+
+    def publish(self, subject: str, *, payload: bytes = b"", reply: str = "") -> None:
+        self._send(PUB_OP, subject, reply, len(payload))
+        self._send(payload)
+
+    def request(
+        self,
+        subject: str,
+        *,
+        payload: bytes = b"",
+        timeout: float = DEFAULT_REQUEST_TIMEOUT,
+    ) -> Optional[NATSMessage]:
+        next_inbox = INBOX_PREFIX[:]
+        next_inbox.extend(self._nuid.next_())
+        reply_subject = next_inbox.decode()
+
+        self._send(SUB_OP, reply_subject, "", 0)
+        self.publish(subject, payload=payload, reply=reply_subject)
+
+        _from_start = now()
+        _from_ping = now()
+        while True:
+            command, result = self._recv(MSG_RE, PING_RE, PONG_RE, OK_RE)
+            if command is None:
+                if now() - _from_start >= timeout:
+                    self._send(UNSUB_OP, 0)
+                    raise NATSRequestTimeoutError()
+                if now() - _from_ping >= self._ping_interval:
+                    _from_ping = now()
+                    self.ping()
+                continue
+            if command is MSG_RE:
+                if result is None:
+                    # Not reachable
+                    return None
+                message = self._recv_message(result)
+                self._send(UNSUB_OP, 0)
+                return message
+            elif command is PING_RE:
+                self._send(PONG_OP)
+
+    def _send(self, *parts: Union[bytes, str, int]) -> None:
+        self._socket.sendall(_SPC_.join(self._encode(p) for p in parts) + _CRLF_)
+
+    def _encode(self, value: Union[bytes, str, int]) -> bytes:
+        if isinstance(value, bytes):
+            return value
+        elif isinstance(value, str):
+            return value.encode()
+        elif isinstance(value, int):
+            return f"{value:d}".encode()
+
+        raise RuntimeError(f"got unsupported type for encoding: type={type(value)}")
+
+    def _recv(
+        self, *commands: Pattern[bytes]
+    ) -> Union[Tuple[Pattern[bytes], Match[bytes]], Tuple[None, None]]:
+        try:
+            line = self._readline()
+        except socket.timeout:
+            return None, None
+        except ssl.SSLError:
+            return None, None
+        except socket.error as e:
+            LOG.error("_read:socket.error:%s", e)
+            return None, None
+
+        command = self._get_command(line)
+        if command not in commands:
+            raise NATSUnexpectedResponse(line)
+
+        result = command.match(line)
+        if result is None:
+            raise NATSInvalidResponse(line)
+
+        return command, result
+
+    def _readline(self, *, size: int = None) -> bytes:
+        result: bytes = b""
+        if size is None:
+            while _CRLF_ not in self._socket_buffer:
+                self._socket_buffer += self._socket.recv(4096)
+            newline_pos = self._socket_buffer.index(_CRLF_) + len(_CRLF_)
+            result = self._socket_buffer[:newline_pos]
+            self._socket_buffer = self._socket_buffer[newline_pos:]
+        else:
+            to_recv_size = size + len(_CRLF_)
+            while len(self._socket_buffer) < to_recv_size:
+                self._socket_buffer += self._socket.recv(4096)
+            result = self._socket_buffer[:to_recv_size]
+            self._socket_buffer = self._socket_buffer[to_recv_size:]
+
+        return result
+
+    def _strip(self, line: bytes) -> bytes:
+        return line[: -len(_CRLF_)]
+
+    def _get_command(self, line: bytes) -> Optional[Pattern[bytes]]:
+        values = self._strip(line).split(b" ", 1)
+
+        return COMMANDS.get(values[0])
+
+    def _recv_message(self, result: Match[bytes]) -> NATSMessage:
+        message_data = result.groupdict()
+
+        message_payload_size = int(message_data["size"])
+        message_payload = self._readline(size=message_payload_size)
+        message_payload = self._strip(message_payload)
+
+        message = NATSMessage(
+            sid=int(message_data["sid"].decode()),
+            subject=message_data["subject"].decode(),
+            reply=message_data["reply"].decode() if message_data["reply"] else "",
+            payload=message_payload,
+        )
+        return message
+
+
+class NATSClient(NATSNoSubscribeClient):
+    __slots__ = (
+        "_conn_options",
+        "_socket",
+        "_socket_buffer",
+        "_socket_options",
+        "_subs_queue",
+        "_send_lock",
+        "_ssid",
+        "_subs",
+        "_nuid",
+        "_ping_interval",
+        "_waiter",
+        "_waiter_enabled",
+        "_pinger",
+        "_pinger_timer",
+        "_workers",
+    )
+
+    def __init__(
+        self,
+        url: str = "nats://127.0.0.1:4222",
+        *,
+        name: str = "nats-python",
+        verbose: bool = False,
+        pedantic: bool = False,
+        tls_cacert: Optional[str] = None,
+        tls_client_cert: Optional[str] = None,
+        tls_client_key: Optional[str] = None,
+        tls_verify: bool = False,
+        socket_timeout: float = DEFAULT_SOCKET_TIMEOUT,
+        socket_keepalive: bool = False,
+        ping_interval: float = DEFAULT_PING_INTERVAL,
+        workers: int = DEFAULT_WORKERS,
+    ) -> None:
+        parsed = urlparse(url)
+        self._conn_options = {
+            "hostname": parsed.hostname,
+            "port": parsed.port,
+            "username": parsed.username,
+            "password": parsed.password,
+            "scheme": parsed.scheme,
+            "name": name,
+            "lang": "python",
+            "protocol": 0,
+            "tls_cacert": tls_cacert,
+            "tls_client_cert": tls_client_cert,
+            "tls_client_key": tls_client_key,
+            "tls_verify": tls_verify,
+            "version": pkg_resources.get_distribution("nats-python").version,
+            "verbose": verbose,
+            "pedantic": pedantic,
+            "workers": workers,
+        }
+
+        self._socket: socket.socket
+        self._socket_buffer: bytes = b""
+        self._socket_options = {
+            "timeout": socket_timeout,
+            "keepalive": socket_keepalive,
+        }
+
+        self._ssid = 0
+        self._subs: Dict[int, NATSSubscription] = {}
+        self._subs_queue: queue.Queue = queue.Queue()
+        self._send_lock: RLock = RLock()
+        self._nuid = NUID()
+        self._waiter: Optional[Thread] = None
+        self._waiter_enabled: bool = False
+        self._pinger: Optional[Thread] = None
+        self._pinger_timer: Event = Event()
+        self._ping_interval = ping_interval
+        self._workers: Optional[ThreadPoolExecutor] = None
+
+    def connect(self) -> None:
+        super().connect()
+
+        self._start_workers()
         self._start_waiter()
         self._start_pinger()
 
     def close(self) -> None:
-        self._workers.shutdown()
-        self._stop_waiter()
         self._stop_pinger()
+        self._stop_waiter()
+        self._stop_workers()
 
-        self._socket.close()
-        self._socket_buffer = b""
+        super().close()
+
+    def _start_workers(self):
+        self._workers = ThreadPoolExecutor(
+            max_workers=self._conn_options["workers"], thread_name_prefix="worker"
+        )
 
     def _start_waiter(self):
         self._waiter = Thread(target=self._waiter_thread, args=(self._subs,))
@@ -276,37 +472,39 @@ class NATSClient:
         self._waiter.start()
 
     def _start_pinger(self):
-        self._pinger_timer.acquire()
+        self._pinger_timer.clear()
         self._pinger = Thread(target=self._pinger_thread)
         self._pinger.start()
+
+    def _stop_workers(self):
+        if self._workers:
+            self._workers.shutdown()
+            self._workers = None
 
     def _stop_waiter(self):
         if self._waiter_enabled:
             self._waiter_enabled = False
-        if self._waiter is not None:
+        self.ping()
+        if self._waiter:
             self._waiter.join()
             self._waiter = None
 
     def _stop_pinger(self):
-        self._pinger_timer.release()
-        if self._pinger is not None:
+        self._pinger_timer.set()
+        if self._pinger:
             self._pinger.join()
             self._pinger = None
 
     @log_exception
     def _pinger_thread(self) -> None:
-        while not self._pinger_timer.acquire(timeout=self._ping_interval):
+        while not self._pinger_timer.wait(timeout=self._ping_interval):
             self._send(PING_OP)
-        self._pinger_timer.release()
+        self._pinger_timer.clear()
 
     def reconnect(self) -> None:
-        self.close()
-        self.connect()
+        super().reconnect()
         for sub in self._subs.values():
             self._send(SUB_OP, sub.subject, sub.queue, sub.sid)
-
-    def ping(self) -> None:
-        self._send(PING_OP)
 
     def subscribe(
         self,
@@ -391,65 +589,6 @@ class NATSClient:
             elif command is PING_RE:
                 self._send(PONG_OP)
 
-    def _encode(self, value: Union[bytes, str, int]) -> bytes:
-        if isinstance(value, bytes):
-            return value
-        elif isinstance(value, str):
-            return value.encode()
-        elif isinstance(value, int):
-            return f"{value:d}".encode()
-
-        raise RuntimeError(f"got unsupported type for encoding: type={type(value)}")
-
-    def _recv(
-        self, *commands: Pattern[bytes]
-    ) -> Union[Tuple[Pattern[bytes], Match[bytes]], Tuple[None, None]]:
-
-        try:
-            line = self._readline()
-        except socket.timeout:
-            return None, None
-        except ssl.SSLError:
-            return None, None
-        except socket.error as e:
-            LOG.error("_read:socket.error:%s", e)
-            return None, None
-
-        command = self._get_command(line)
-        if command not in commands:
-            raise NATSUnexpectedResponse(line)
-
-        result = command.match(line)
-        if result is None:
-            raise NATSInvalidResponse(line)
-
-        return command, result
-
-    def _readline(self, *, size: int = None) -> bytes:
-        result: bytes = b""
-        if size is None:
-            while _CRLF_ not in self._socket_buffer:
-                self._socket_buffer += self._socket.recv(128)
-            newline_pos = self._socket_buffer.index(_CRLF_) + len(_CRLF_)
-            result = self._socket_buffer[:newline_pos]
-            self._socket_buffer = self._socket_buffer[newline_pos:]
-        else:
-            to_recv_size = size + len(_CRLF_)
-            while len(self._socket_buffer) < to_recv_size:
-                self._socket_buffer += self._socket.recv(4096)
-            result = self._socket_buffer[:to_recv_size]
-            self._socket_buffer = self._socket_buffer[to_recv_size:]
-
-        return result
-
-    def _strip(self, line: bytes) -> bytes:
-        return line[: -len(_CRLF_)]
-
-    def _get_command(self, line: bytes) -> Optional[Pattern[bytes]]:
-        values = self._strip(line).split(b" ", 1)
-
-        return COMMANDS.get(values[0])
-
     def _handle_message(self, result: Match[bytes]) -> None:
         message_data = result.groupdict()
 
@@ -470,4 +609,5 @@ class NATSClient:
         if sub.is_wasted():
             self._subs.pop(sub.sid, None)
 
-        self._workers.submit(sub.callback, message)
+        if self._workers:
+            self._workers.submit(sub.callback, message)
