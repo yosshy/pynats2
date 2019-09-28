@@ -3,6 +3,7 @@ __all__ = (
     "NATSError",
     "NATSInvalidResponse",
     "NATSInvalidSchemeError",
+    "NATSInvalidUrlError",
     "NATSTCPConnectionRequiredError",
     "NATSTLSConnectionRequiredError",
     "NATSUnexpectedResponse",
@@ -39,6 +40,12 @@ class NATSTCPConnectionRequiredError(NATSConnectionError):
 
 
 class NATSTLSConnectionRequiredError(NATSConnectionError):
+    def __init__(self, line: str, *args, **kwargs) -> None:
+        self.line = line
+        super().__init__(line, *args, **kwargs)
+
+
+class NATSInvalidUrlError(NATSConnectionError):
     def __init__(self, line: str, *args, **kwargs) -> None:
         self.line = line
         super().__init__(line, *args, **kwargs)

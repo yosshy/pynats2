@@ -17,6 +17,7 @@ from pynats.exceptions import (
     NATSConnectionError,
     NATSInvalidResponse,
     NATSInvalidSchemeError,
+    NATSInvalidUrlError,
     NATSRequestTimeoutError,
     NATSTCPConnectionRequiredError,
     NATSTLSConnectionRequiredError,
@@ -115,6 +116,8 @@ class NATSNoSubscribeClient:
         "_ping_interval",
         "_waiter",
         "_waiter_enabled",
+        "_vhost_name",
+        "_vhost_len",
     )
 
     def __init__(
@@ -132,7 +135,10 @@ class NATSNoSubscribeClient:
         socket_keepalive: bool = False,
         ping_interval: float = DEFAULT_PING_INTERVAL,
     ) -> None:
-        parsed = urlparse(url)
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            raise NATSInvalidUrlError(url)
         self._conn_options = {
             "hostname": parsed.hostname,
             "port": parsed.port,
@@ -151,6 +157,11 @@ class NATSNoSubscribeClient:
             "pedantic": pedantic,
         }
 
+        vhost: str = parsed.path.strip("/").replace("/", ".")
+        if len(vhost) > 0:
+            vhost += "."
+        self._vhost_name: str = vhost
+        self._vhost_len: int = len(vhost)
         self._socket: socket.socket
         self._socket_buffer: bytes = b""
         self._socket_options = {
@@ -168,6 +179,19 @@ class NATSNoSubscribeClient:
 
     def __exit__(self, type_, value, traceback) -> None:
         self.close()
+
+    def _vhost(self, subject: str) -> str:
+        if self._vhost_name == "":
+            return subject
+        return "%s%s" % (self._vhost_name, subject)
+
+    def _del_vhost(self, subject: str) -> str:
+        subject = subject.strip()
+        if self._vhost_name == "":
+            return subject
+        if subject.startswith(self._vhost_name):
+            return subject[self._vhost_len :]
+        return subject
 
     def _send_connect_command(self) -> None:
         options = {
@@ -257,7 +281,7 @@ class NATSNoSubscribeClient:
         self._send(PING_OP)
 
     def publish(self, subject: str, *, payload: bytes = b"", reply: str = "") -> None:
-        self._send(PUB_OP, subject, reply, len(payload))
+        self._send(PUB_OP, self._vhost(subject), self._vhost(reply), len(payload))
         self._send(payload)
 
     def request(
@@ -271,7 +295,7 @@ class NATSNoSubscribeClient:
         next_inbox.extend(self._nuid.next_())
         reply_subject = next_inbox.decode()
 
-        self._send(SUB_OP, reply_subject, "", 0)
+        self._send(SUB_OP, self._vhost(reply_subject), "", 0)
         self.publish(subject, payload=payload, reply=reply_subject)
 
         _from_start = now()
@@ -366,8 +390,10 @@ class NATSNoSubscribeClient:
 
         message = NATSMessage(
             sid=int(message_data["sid"].decode()),
-            subject=message_data["subject"].decode(),
-            reply=message_data["reply"].decode() if message_data["reply"] else "",
+            subject=self._del_vhost(message_data["subject"].decode()),
+            reply=self._del_vhost(message_data["reply"].decode())
+            if message_data["reply"]
+            else "",
             payload=message_payload,
         )
         return message
@@ -387,6 +413,8 @@ class NATSClient(NATSNoSubscribeClient):
         "_ping_interval",
         "_waiter",
         "_waiter_enabled",
+        "_vhost_name",
+        "_vhost_len",
         "_pinger",
         "_pinger_timer",
         "_workers",
@@ -408,7 +436,10 @@ class NATSClient(NATSNoSubscribeClient):
         ping_interval: float = DEFAULT_PING_INTERVAL,
         workers: int = DEFAULT_WORKERS,
     ) -> None:
-        parsed = urlparse(url)
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            raise NATSInvalidUrlError(url)
         self._conn_options = {
             "hostname": parsed.hostname,
             "port": parsed.port,
@@ -428,6 +459,11 @@ class NATSClient(NATSNoSubscribeClient):
             "workers": workers,
         }
 
+        vhost: str = parsed.path.strip("/").replace("/", ".")
+        if len(vhost) > 0:
+            vhost += "."
+        self._vhost_name: str = vhost
+        self._vhost_len: int = len(vhost)
         self._socket: socket.socket
         self._socket_buffer: bytes = b""
         self._socket_options = {
@@ -504,7 +540,7 @@ class NATSClient(NATSNoSubscribeClient):
     def reconnect(self) -> None:
         super().reconnect()
         for sub in self._subs.values():
-            self._send(SUB_OP, sub.subject, sub.queue, sub.sid)
+            self._send(SUB_OP, self._vhost(sub.subject), sub.queue, sub.sid)
 
     def subscribe(
         self,
@@ -524,7 +560,7 @@ class NATSClient(NATSNoSubscribeClient):
 
         self._ssid += 1
         self._subs[sub.sid] = sub
-        self._send(SUB_OP, sub.subject, sub.queue, sub.sid)
+        self._send(SUB_OP, self._vhost(sub.subject), sub.queue, sub.sid)
 
         self._stop_waiter()
         self._start_waiter()
@@ -545,7 +581,7 @@ class NATSClient(NATSNoSubscribeClient):
 
     def publish(self, subject: str, *, payload: bytes = b"", reply: str = "") -> None:
         with self._send_lock:
-            self._send(PUB_OP, subject, reply, len(payload))
+            self._send(PUB_OP, self._vhost(subject), self._vhost(reply), len(payload))
             self._send(payload)
 
     def request(
@@ -598,8 +634,10 @@ class NATSClient(NATSNoSubscribeClient):
 
         message = NATSMessage(
             sid=int(message_data["sid"].decode()),
-            subject=message_data["subject"].decode(),
-            reply=message_data["reply"].decode() if message_data["reply"] else "",
+            subject=self._del_vhost(message_data["subject"].decode()),
+            reply=self._del_vhost(message_data["reply"].decode())
+            if message_data["reply"]
+            else "",
             payload=message_payload,
         )
 
