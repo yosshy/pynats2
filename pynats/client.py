@@ -520,7 +520,10 @@ class NATSClient(NATSNoSubscribeClient):
     def _stop_waiter(self):
         if self._waiter_enabled:
             self._waiter_enabled = False
-        self.ping()
+        try:
+            self.ping()
+        except socket.error:
+            pass
         if self._waiter:
             self._waiter.join()
             self._waiter = None
