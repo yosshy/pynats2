@@ -436,51 +436,29 @@ class NATSClient(NATSNoSubscribeClient):
         ping_interval: float = DEFAULT_PING_INTERVAL,
         workers: int = DEFAULT_WORKERS,
     ) -> None:
-        try:
-            parsed = urlparse(url)
-        except ValueError:
-            raise NATSInvalidUrlError(url)
-        self._conn_options = {
-            "hostname": parsed.hostname,
-            "port": parsed.port,
-            "username": parsed.username,
-            "password": parsed.password,
-            "scheme": parsed.scheme,
-            "name": name,
-            "lang": "python",
-            "protocol": 0,
-            "tls_cacert": tls_cacert,
-            "tls_client_cert": tls_client_cert,
-            "tls_client_key": tls_client_key,
-            "tls_verify": tls_verify,
-            "version": pkg_resources.get_distribution("nats-python").version,
-            "verbose": verbose,
-            "pedantic": pedantic,
-            "workers": workers,
-        }
+        super().__init__(
+            url,
+            name=name,
+            verbose=verbose,
+            pedantic=pedantic,
+            tls_cacert=tls_cacert,
+            tls_client_cert=tls_client_cert,
+            tls_client_key=tls_client_key,
+            tls_verify=tls_verify,
+            socket_timeout=socket_timeout,
+            socket_keepalive=socket_keepalive,
+            ping_interval=ping_interval,
+        )
 
-        vhost: str = parsed.path.strip("/").replace("/", ".")
-        if len(vhost) > 0:
-            vhost += "."
-        self._vhost_name: str = vhost
-        self._vhost_len: int = len(vhost)
-        self._socket: socket.socket
-        self._socket_buffer: bytes = b""
-        self._socket_options = {
-            "timeout": socket_timeout,
-            "keepalive": socket_keepalive,
-        }
+        self._conn_options["workers"] = workers
 
-        self._ssid = 0
         self._subs: Dict[int, NATSSubscription] = {}
         self._subs_queue: queue.Queue = queue.Queue()
         self._send_lock: RLock = RLock()
-        self._nuid = NUID()
         self._waiter: Optional[Thread] = None
         self._waiter_enabled: bool = False
         self._pinger: Optional[Thread] = None
         self._pinger_timer: Event = Event()
-        self._ping_interval = ping_interval
         self._workers: Optional[ThreadPoolExecutor] = None
 
     def connect(self) -> None:
