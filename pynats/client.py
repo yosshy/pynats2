@@ -247,7 +247,6 @@ class NATSNoSubscribeClient:
         hostname = str(self._conn_options["hostname"])
         self._socket = ctx.wrap_socket(self._socket, server_hostname=hostname)
         self._send_connect_command()
-        self._recv(OK_RE)
 
     def connect(self) -> None:
         sock = socket.socket(family=socket.AF_INET, type=socket.SOCK_STREAM)
