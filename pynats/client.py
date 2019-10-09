@@ -144,7 +144,6 @@ class NATSNoSubscribeClient:
             "port": parsed.port,
             "username": parsed.username,
             "password": parsed.password,
-            "scheme": parsed.scheme,
             "name": name,
             "lang": "python",
             "protocol": 0,
@@ -156,6 +155,14 @@ class NATSNoSubscribeClient:
             "verbose": verbose,
             "pedantic": pedantic,
         }
+        if parsed.scheme == "nats":
+            self._conn_options["tls"] = False
+        elif parsed.scheme == "tls":
+            self._conn_options["tls"] = True
+        else:
+            raise NATSInvalidSchemeError(
+                f"got unsupported URI scheme: %s" % parsed.scheme
+            )
 
         vhost: str = parsed.path.strip("/").replace("/", ".")
         if len(vhost) > 0:
@@ -211,23 +218,7 @@ class NATSNoSubscribeClient:
 
         self._send(CONNECT_OP, json.dumps(options))
 
-    def _connect_tcp(self) -> None:
-        self._send_connect_command()
-        _command, result = self._recv(INFO_RE)
-        if result is None:
-            raise NATSConnectionError("connection failed")
-        server_info = json.loads(result.group(1))
-        if server_info.get("tls_required", False):
-            raise NATSTLSConnectionRequiredError("server enabled TLS connection")
-
     def _connect_tls(self) -> None:
-        _command, result = self._recv(INFO_RE)
-        if result is None:
-            raise NATSConnectionError("connection failed")
-        server_info = json.loads(result.group(1))
-        if not server_info.get("tls_required", False):
-            raise NATSTCPConnectionRequiredError("server disabled TLS connection")
-
         ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
         if self._conn_options["tls_verify"]:
             if self._conn_options["tls_cacert"] is not None:
@@ -246,7 +237,6 @@ class NATSNoSubscribeClient:
 
         hostname = str(self._conn_options["hostname"])
         self._socket = ctx.wrap_socket(self._socket, server_hostname=hostname)
-        self._send_connect_command()
 
     def connect(self) -> None:
         sock = socket.socket(family=socket.AF_INET, type=socket.SOCK_STREAM)
@@ -260,13 +250,21 @@ class NATSNoSubscribeClient:
 
         self._socket = sock
 
-        scheme = self._conn_options["scheme"]
-        if scheme == "nats":
-            self._connect_tcp()
-        elif scheme == "tls":
+        _command, result = self._recv(INFO_RE)
+        if result is None:
+            raise NATSConnectionError("connection failed")
+
+        server_info = json.loads(result.group(1))
+        if server_info.get("tls_required", False) != self._conn_options["tls"]:
+            if self._conn_options["tls"]:
+                raise NATSTCPConnectionRequiredError("server disabled TLS connection")
+            else:
+                raise NATSTLSConnectionRequiredError("server enabled TLS connection")
+
+        if self._conn_options["tls"]:
             self._connect_tls()
-        else:
-            raise NATSInvalidSchemeError(f"got unsupported URI scheme: {scheme}")
+
+        self._send_connect_command()
 
     def close(self) -> None:
         self._socket.close()

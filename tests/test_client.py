@@ -63,10 +63,8 @@ def test_tls_connect():
 
 
 def test_invalid_scheme():
-    client = NATSClient("http://127.0.0.1:4224", verbose=True)
-
     with pytest.raises(NATSInvalidSchemeError):
-        client.connect()
+        NATSClient("http://127.0.0.1:4224", verbose=True)
 
 
 def test_subscribe_unsubscribe(nats_url):
