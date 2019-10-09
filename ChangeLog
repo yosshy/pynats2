@@ -1,0 +1,66 @@
+CHANGES
+=======
+
+0.6.0
+-----
+
+* Add setup scripts
+* Improve scheme handling
+* Remove \_recv() from \_connect\_tls()
+* Make NATSClient.\_\_init\_\_() simple
+* Catch exception on ping at \_stop\_waiter()
+* Add virtual host support
+* Add NATSNoSubscribeClient class
+* Revert "Add auto\_reconnect option to NATSClient"
+* Add auto\_reconnect option to NATSClient
+* Refactor waiter and pinger
+* Add ping thread
+* Add worker threads for message handling
+* Add \_waiter(): threaded wait()
+* Add read/send lock for multi-threading
+* Support TLS
+* [release] back to development
+
+0.5.0
+-----
+
+* [release] uprev
+* [fix] fixed passing of subscription queue name to the NATS server (#3)
+* [ci] switch to Drone CI
+* update badges
+* fixup mypy issues
+* pin minimal required deps
+* fixup black dep installation
+* back to development
+
+0.4.0
+-----
+
+* uprev
+* Use \`BytesIO\` as read buffer
+* back to development
+
+0.3.0
+-----
+
+* uprev
+* Improved receive messages logic
+* Fixed regex deprecation warnings
+* Improved receive messages logic: \`.strip()\` replaced with \`.replace()\`
+* back to development
+
+0.2.0
+-----
+
+* uprev
+* Simplify socket initialization
+* Changed subscription ID generation logic from \`nuid\` to \`int\`
+* back to development
+
+0.1.0
+-----
+
+* uprev
+* Fixup tests
+* Travis CI and NATS.io
+* Initial commit

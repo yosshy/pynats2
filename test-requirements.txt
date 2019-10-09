@@ -1,0 +1,4 @@
+setuptools_black
+black
+flake8
+mypy
