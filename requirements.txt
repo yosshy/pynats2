@@ -1,1 +1,2 @@
 pbr
+dataclasses;python_version<'3.7'
