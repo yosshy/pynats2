@@ -6,13 +6,12 @@ import time
 import msgpack
 import pytest
 
-from pynats import (
+from pynats2 import (
     NATSClient,
-    NATSNoSubscribeClient,
     NATSInvalidSchemeError,
+    NATSNoSubscribeClient,
     NATSRequestTimeoutError,
 )
-
 
 event = threading.Event()
 

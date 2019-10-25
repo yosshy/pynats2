@@ -1,4 +1,4 @@
-from .client import NATSClient, NATSNoSubscribeClient, NATSMessage, NATSSubscription
+from .client import NATSClient, NATSMessage, NATSNoSubscribeClient, NATSSubscription
 from .exceptions import (
     NATSConnectionError,
     NATSError,

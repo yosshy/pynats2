@@ -1,23 +1,21 @@
-# nats-python
+# pynats2
 
-[![Build Status](https://cloud.drone.io/api/badges/Gr1N/nats-python/status.svg)](https://cloud.drone.io/Gr1N/nats-python) [![codecov](https://codecov.io/gh/Gr1N/nats-python/branch/master/graph/badge.svg)](https://codecov.io/gh/Gr1N/nats-python) ![PyPI](https://img.shields.io/pypi/v/nats-python.svg?label=pypi%20version) ![PyPI - Downloads](https://img.shields.io/pypi/dm/nats-python.svg?label=pypi%20downloads)
+Thread based python client for NATS messaging system.
 
-Python client for NATS messaging system.
-
-This project is a replacement for abandoned [pynats](https://github.com/mcuadros/pynats). `nats-python` supports only Python 3.6+ and fully covered with typings.
+This project is a replacement for abandoned [pynats](https://github.com/mcuadros/pynats) and [nats-python](git@github.com:Gr1N/nats-python). `pynats2` supports only Python 3.6+ and fully covered with typings.
 
 Go to the [asyncio-nats](https://github.com/nats-io/asyncio-nats) project, if you're looking for `asyncio` implementation.
 
 ## Installation
 
 ```sh
-$ pip install nats-python
+$ pip install pynats2
 ```
 
 ## Usage
 
 ```python
-from pynats import NATSClient
+from pynats2 import NATSClient
 
 with NATSClient() as client:
     client.publish("test-subject", payload=b"test-payload")
@@ -25,25 +23,22 @@ with NATSClient() as client:
 
 ## Contributing
 
-To work on the `nats-python` codebase, you'll want to clone the project locally and install the required dependencies via [poetry](https://poetry.eustace.io):
+To work on the `pynats2` codebase, you'll want to clone the project locally and install the required dependencies via pip.
 
 ```sh
-$ git clone git@github.com:Gr1N/nats-python.git
-$ make install
+$ git clone git@github.com:yosshy/pynats2.git
+$ pip install -r requirements.txt
+$ python setup.py install
 ```
 
 To run tests and linters use command below:
 
 ```sh
-$ make lint && make test
-```
-
-If you want to run only tests or linters you can explicitly specify which test environment you want to run, e.g.:
-
-```sh
-$ make lint-black
+$ black --check --diff .
+$ flake8 pynats2 tests
+$ mypy --ignore-missing-imports --follow-imports=silent pynats2 tests
 ```
 
 ## License
 
-`nats-python` is licensed under the MIT license. See the license file for details.
+`pynats2` is licensed under the MIT license. See the license file for details.

@@ -1,19 +1,19 @@
 import json
 import logging
-import pkg_resources
 import queue
 import re
 import socket
 import ssl
-from time import monotonic as now
-
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from threading import Thread, RLock, Event
+from threading import Event, RLock, Thread
+from time import monotonic as now
 from typing import Callable, Dict, Match, Optional, Pattern, Tuple, Union
 from urllib.parse import urlparse
 
-from pynats.exceptions import (
+import pkg_resources
+
+from pynats2.exceptions import (
     NATSConnectionError,
     NATSInvalidResponse,
     NATSInvalidSchemeError,
@@ -23,7 +23,7 @@ from pynats.exceptions import (
     NATSTLSConnectionRequiredError,
     NATSUnexpectedResponse,
 )
-from pynats.nuid import NUID
+from pynats2.nuid import NUID
 
 __all__ = ("NATSSubscription", "NATSMessage", "NATSClient", "NATSNoSubscribeClient")
 
@@ -124,7 +124,7 @@ class NATSNoSubscribeClient:
         self,
         url: str = "nats://127.0.0.1:4222",
         *,
-        name: str = "nats-python",
+        name: str = "pynats2",
         verbose: bool = False,
         pedantic: bool = False,
         tls_cacert: Optional[str] = None,
@@ -151,7 +151,7 @@ class NATSNoSubscribeClient:
             "tls_client_cert": tls_client_cert,
             "tls_client_key": tls_client_key,
             "tls_verify": tls_verify,
-            "version": pkg_resources.get_distribution("nats-python").version,
+            "version": pkg_resources.get_distribution("pynats2").version,
             "verbose": verbose,
             "pedantic": pedantic,
         }
@@ -421,7 +421,7 @@ class NATSClient(NATSNoSubscribeClient):
         self,
         url: str = "nats://127.0.0.1:4222",
         *,
-        name: str = "nats-python",
+        name: str = "pynats2",
         verbose: bool = False,
         pedantic: bool = False,
         tls_cacert: Optional[str] = None,

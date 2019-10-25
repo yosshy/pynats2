@@ -129,9 +129,11 @@ venv.bak/
 # mypy
 .mypy_cache/
 
+# pypi
+.pypirc
+
 ### VisualStudioCode ###
 .vscode/
 .history
-
 
 # End of https://www.gitignore.io/api/osx,python,visualstudiocode
