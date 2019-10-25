@@ -41,6 +41,12 @@ def test_connect_timeout():
         client.connect()
 
 
+def test_connect_multiple_urls(nats_url):
+    urls = nats_url + "," + nats_url
+    with NATSClient(urls) as client:
+        client.ping()
+
+
 def test_reconnect(nats_url):
     client = NATSClient(nats_url)
 

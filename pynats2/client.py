@@ -8,8 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Event, RLock, Thread
 from time import monotonic as now
-from typing import Callable, Dict, Match, Optional, Pattern, Tuple, Union
-from urllib.parse import urlparse
+from typing import Callable, List, Dict, Match, Optional, Pattern, Tuple, Union
+from urllib.parse import urlparse, ParseResult
 
 import pkg_resources
 
@@ -105,6 +105,12 @@ class NATSMessage:
 
 class NATSNoSubscribeClient:
     __slots__ = (
+        "_parsed_urls",
+        "_url_index",
+        "_tls_cacert",
+        "_tls_client_cert",
+        "_tls_client_key",
+        "_tls_verify",
         "_conn_options",
         "_socket",
         "_socket_buffer",
@@ -135,34 +141,33 @@ class NATSNoSubscribeClient:
         socket_keepalive: bool = False,
         ping_interval: float = DEFAULT_PING_INTERVAL,
     ) -> None:
-        try:
-            parsed = urlparse(url)
-        except ValueError:
-            raise NATSInvalidUrlError(url)
+        self._url_index: int = 0
+        self._parsed_urls: List[ParseResult] = []
+        self._tls_cacert = tls_cacert
+        self._tls_client_cert = tls_client_cert
+        self._tls_client_key = tls_client_key
+        self._tls_verify = tls_verify
+
+        for _url in url.split(","):
+            try:
+                parsed = urlparse(_url)
+                self._parsed_urls.append(parsed)
+            except ValueError:
+                raise NATSInvalidUrlError(_url)
+
+            if parsed.scheme not in ("nats", "tls"):
+                raise NATSInvalidSchemeError(
+                    f"got unsupported URI scheme: %s" % parsed.scheme
+                )
+
         self._conn_options = {
-            "hostname": parsed.hostname,
-            "port": parsed.port,
-            "username": parsed.username,
-            "password": parsed.password,
             "name": name,
             "lang": "python",
             "protocol": 0,
-            "tls_cacert": tls_cacert,
-            "tls_client_cert": tls_client_cert,
-            "tls_client_key": tls_client_key,
-            "tls_verify": tls_verify,
             "version": pkg_resources.get_distribution("pynats2").version,
             "verbose": verbose,
             "pedantic": pedantic,
         }
-        if parsed.scheme == "nats":
-            self._conn_options["tls"] = False
-        elif parsed.scheme == "tls":
-            self._conn_options["tls"] = True
-        else:
-            raise NATSInvalidSchemeError(
-                f"got unsupported URI scheme: %s" % parsed.scheme
-            )
 
         vhost: str = parsed.path.strip("/").replace("/", ".")
         if len(vhost) > 0:
@@ -210,32 +215,31 @@ class NATSNoSubscribeClient:
             "pedantic": self._conn_options["pedantic"],
         }
 
-        if self._conn_options["username"] and self._conn_options["password"]:
-            options["user"] = self._conn_options["username"]
-            options["pass"] = self._conn_options["password"]
-        elif self._conn_options["username"]:
-            options["auth_token"] = self._conn_options["username"]
+        username = self._parsed_urls[self._url_index].username
+        password = self._parsed_urls[self._url_index].password
+        if username and password:
+            options["user"] = username
+            options["pass"] = password
+        elif username:
+            options["auth_token"] = username
 
         self._send(CONNECT_OP, json.dumps(options))
 
     def _connect_tls(self) -> None:
         ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
-        if self._conn_options["tls_verify"]:
-            if self._conn_options["tls_cacert"] is not None:
-                ctx.load_verify_locations(cafile=str(self._conn_options["tls_cacert"]))
-            if (
-                self._conn_options["tls_client_cert"] is not None
-                and self._conn_options["tls_client_key"] is not None
-            ):
+        if self._tls_verify:
+            if self._tls_cacert is not None:
+                ctx.load_verify_locations(cafile=self._tls_cacert)
+            if self._tls_client_cert is not None and self._tls_client_key is not None:
                 ctx.load_cert_chain(
-                    certfile=str(self._conn_options["tls_client_cert"]),
-                    keyfile=str(self._conn_options["tls_client_key"]),
+                    certfile=str(self._tls_client_cert),
+                    keyfile=str(self._tls_client_key),
                 )
         else:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
 
-        hostname = str(self._conn_options["hostname"])
+        hostname = self._parsed_urls[self._url_index].hostname
         self._socket = ctx.wrap_socket(self._socket, server_hostname=hostname)
 
     def connect(self) -> None:
@@ -246,7 +250,9 @@ class NATSNoSubscribeClient:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
         sock.settimeout(self._socket_options["timeout"])
-        sock.connect((self._conn_options["hostname"], self._conn_options["port"]))
+        hostname = self._parsed_urls[self._url_index].hostname
+        port = self._parsed_urls[self._url_index].port
+        sock.connect((hostname, port))
 
         self._socket = sock
 
@@ -255,13 +261,14 @@ class NATSNoSubscribeClient:
             raise NATSConnectionError("connection failed")
 
         server_info = json.loads(result.group(1))
-        if server_info.get("tls_required", False) != self._conn_options["tls"]:
-            if self._conn_options["tls"]:
+        tls = self._parsed_urls[self._url_index].scheme == "tls"
+        if server_info.get("tls_required", False) != tls:
+            if tls:
                 raise NATSTCPConnectionRequiredError("server disabled TLS connection")
             else:
                 raise NATSTLSConnectionRequiredError("server enabled TLS connection")
 
-        if self._conn_options["tls"]:
+        if tls:
             self._connect_tls()
 
         self._send_connect_command()
@@ -398,6 +405,12 @@ class NATSNoSubscribeClient:
 
 class NATSClient(NATSNoSubscribeClient):
     __slots__ = (
+        "_parsed_urls",
+        "_url_index",
+        "_tls_cacert",
+        "_tls_client_cert",
+        "_tls_client_key",
+        "_tls_verify",
         "_conn_options",
         "_socket",
         "_socket_buffer",
