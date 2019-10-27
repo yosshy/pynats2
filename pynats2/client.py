@@ -7,7 +7,7 @@ import ssl
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Event, RLock, Thread
-from time import monotonic as now
+from time import monotonic as now, sleep
 from typing import Callable, List, Dict, Match, Optional, Pattern, Tuple, Union
 from urllib.parse import urlparse, ParseResult
 
@@ -41,6 +41,7 @@ OK_OP = b"+OK"
 ERR_OP = b"-ERR"
 
 DEFAULT_PING_INTERVAL = 30.0
+DEFAULT_RECONNECT_DELAY = 10.0
 DEFAULT_REQUEST_TIMEOUT = 120.0
 DEFAULT_SOCKET_TIMEOUT = 1.0
 DEFAULT_WORKERS = 3
@@ -79,6 +80,28 @@ def log_exception(func):
     return wrapper
 
 
+def auto_reconnect(func) -> Callable:
+    def wrapper(self, *args, **kwargs):
+        while True:
+            for _ in self._parsed_urls:
+                try:
+                    return func(self, *args, **kwargs)
+                except (socket.error, ssl.SSLError) as e:
+                    LOG.error(str(e))
+                    self._url_index += 1
+                    if self._url_index >= len(self._parsed_urls):
+                        self._url_index = 0
+                    if func.__name__ != "connect":
+                        self.reconnect()
+
+            if not self._reconnect_forever:
+                raise NATSConnectionError("all connection failed")
+
+            sleep(self._reconnect_delay)
+
+    return wrapper
+
+
 @dataclass
 class NATSSubscription:
     sid: int
@@ -110,6 +133,8 @@ class NATSNoSubscribeClient:
         "_parsed_urls",
         "_pedantic",
         "_ping_interval",
+        "_reconnect_delay",
+        "_reconnect_forever",
         "_socket",
         "_socket_buffer",
         "_socket_keepalive",
@@ -132,25 +157,30 @@ class NATSNoSubscribeClient:
         url: str = "nats://127.0.0.1:4222",
         *,
         name: str = "pynats2",
-        verbose: bool = False,
         pedantic: bool = False,
+        ping_interval: float = DEFAULT_PING_INTERVAL,
+        reconnect: bool = False,
+        reconnect_delay: float = DEFAULT_RECONNECT_DELAY,
+        reconnect_forever: bool = False,
         tls_cacert: Optional[str] = None,
         tls_client_cert: Optional[str] = None,
         tls_client_key: Optional[str] = None,
         tls_verify: bool = False,
-        socket_timeout: float = DEFAULT_SOCKET_TIMEOUT,
         socket_keepalive: bool = False,
-        ping_interval: float = DEFAULT_PING_INTERVAL,
+        socket_timeout: float = DEFAULT_SOCKET_TIMEOUT,
+        verbose: bool = False,
     ) -> None:
         self._name: str = name
         self._nuid: NUID = NUID()
         self._parsed_urls: List[ParseResult] = []
         self._pedantic: bool = pedantic
         self._ping_interval: float = ping_interval
+        self._reconnect_delay: float = reconnect_delay
+        self._reconnect_forever = reconnect_forever
         self._socket: socket.socket
         self._socket_buffer: bytes = b""
-        self._socket_timeout: float = socket_timeout
         self._socket_keepalive: bool = socket_keepalive
+        self._socket_timeout: float = socket_timeout
         self._ssid: int = 0
         self._tls_cacert: Optional[str] = tls_cacert
         self._tls_client_cert: Optional[str] = tls_client_cert
@@ -234,6 +264,7 @@ class NATSNoSubscribeClient:
         hostname = self._parsed_urls[self._url_index].hostname
         self._socket = ctx.wrap_socket(self._socket, server_hostname=hostname)
 
+    @auto_reconnect
     def connect(self) -> None:
         sock = socket.socket(family=socket.AF_INET, type=socket.SOCK_STREAM)
 
@@ -266,20 +297,26 @@ class NATSNoSubscribeClient:
         self._send_connect_command()
 
     def close(self) -> None:
-        self._socket.close()
-        self._socket_buffer = b""
+        try:
+            self._socket.close()
+            self._socket_buffer = b""
+        except (socket.error, ssl.SSLError):
+            pass
 
     def reconnect(self) -> None:
         self.close()
         self.connect()
 
+    @auto_reconnect
     def ping(self) -> None:
         self._send(PING_OP)
 
+    @auto_reconnect
     def publish(self, subject: str, *, payload: bytes = b"", reply: str = "") -> None:
         self._send(PUB_OP, self._vhost(subject), self._vhost(reply), len(payload))
         self._send(payload)
 
+    @auto_reconnect
     def request(
         self,
         subject: str,
@@ -404,6 +441,8 @@ class NATSClient(NATSNoSubscribeClient):
         "_ping_interval",
         "_pinger",
         "_pinger_timer",
+        "_reconnect_delay",
+        "_reconnect_forever",
         "_send_lock",
         "_socket",
         "_socket_buffer",
@@ -430,29 +469,33 @@ class NATSClient(NATSNoSubscribeClient):
         url: str = "nats://127.0.0.1:4222",
         *,
         name: str = "pynats2",
-        verbose: bool = False,
         pedantic: bool = False,
+        ping_interval: float = DEFAULT_PING_INTERVAL,
+        reconnect_delay: float = DEFAULT_RECONNECT_DELAY,
+        reconnect_forever: bool = False,
         tls_cacert: Optional[str] = None,
         tls_client_cert: Optional[str] = None,
         tls_client_key: Optional[str] = None,
         tls_verify: bool = False,
-        socket_timeout: float = DEFAULT_SOCKET_TIMEOUT,
         socket_keepalive: bool = False,
-        ping_interval: float = DEFAULT_PING_INTERVAL,
+        socket_timeout: float = DEFAULT_SOCKET_TIMEOUT,
+        verbose: bool = False,
         workers: int = DEFAULT_WORKERS,
     ) -> None:
         super().__init__(
             url,
             name=name,
-            verbose=verbose,
             pedantic=pedantic,
+            ping_interval=ping_interval,
+            reconnect_delay=reconnect_delay,
+            reconnect_forever=reconnect_forever,
             tls_cacert=tls_cacert,
             tls_client_cert=tls_client_cert,
             tls_client_key=tls_client_key,
             tls_verify=tls_verify,
-            socket_timeout=socket_timeout,
             socket_keepalive=socket_keepalive,
-            ping_interval=ping_interval,
+            socket_timeout=socket_timeout,
+            verbose=verbose,
         )
 
         self._pinger: Optional[Thread] = None
@@ -473,11 +516,14 @@ class NATSClient(NATSNoSubscribeClient):
         self._start_pinger()
 
     def close(self) -> None:
-        self._stop_pinger()
-        self._stop_waiter()
-        self._stop_workers()
+        try:
+            self._stop_pinger()
+            self._stop_waiter()
+            self._stop_workers()
 
-        super().close()
+            super().close()
+        except (socket.error, ssl.SSLError):
+            pass
 
     def _start_workers(self):
         self._workers = ThreadPoolExecutor(
@@ -523,10 +569,12 @@ class NATSClient(NATSNoSubscribeClient):
         self._pinger_timer.clear()
 
     def reconnect(self) -> None:
-        super().reconnect()
+        self.close()
+        self.connect()
         for sub in self._subs.values():
             self._send(SUB_OP, self._vhost(sub.subject), sub.queue, sub.sid)
 
+    @auto_reconnect
     def subscribe(
         self,
         subject: str,
@@ -552,23 +600,27 @@ class NATSClient(NATSNoSubscribeClient):
 
         return sub
 
+    @auto_reconnect
     def unsubscribe(self, sub: NATSSubscription) -> None:
         self._subs.pop(sub.sid, None)
         self._send(UNSUB_OP, sub.sid)
         self._stop_waiter()
         self._start_waiter()
 
+    @auto_reconnect
     def auto_unsubscribe(self, sub: NATSSubscription) -> None:
         if sub.max_messages is None:
             return
 
         self._send(UNSUB_OP, sub.sid, sub.max_messages)
 
+    @auto_reconnect
     def publish(self, subject: str, *, payload: bytes = b"", reply: str = "") -> None:
         with self._send_lock:
             self._send(PUB_OP, self._vhost(subject), self._vhost(reply), len(payload))
             self._send(payload)
 
+    @auto_reconnect
     def request(
         self,
         subject: str,

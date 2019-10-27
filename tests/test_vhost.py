@@ -1,5 +1,4 @@
 import os
-import socket
 import threading
 import time
 
@@ -8,6 +7,7 @@ import pytest
 
 from pynats2 import (
     NATSClient,
+    NATSConnectionError,
     NATSInvalidSchemeError,
     NATSNoSubscribeClient,
     NATSRequestTimeoutError,
@@ -19,6 +19,11 @@ event = threading.Event()
 @pytest.fixture
 def nats_url():
     return os.environ.get("NATS_URL", "nats://127.0.0.1:4222/vhost1")
+
+
+@pytest.fixture
+def nats_invalid_url():
+    return os.environ.get("NATS_INVALID_URL", "nats://127.0.0.1:4223/vhost1")
 
 
 def test_connect_and_close(nats_url):
@@ -34,10 +39,10 @@ def test_connect_and_close_using_context_manager(nats_url):
         client.ping()
 
 
-def test_connect_timeout():
-    client = NATSClient("nats://127.0.0.1:4223/vhost1")
+def test_connect_rejected(nats_invalid_url):
+    client = NATSClient(nats_invalid_url)
 
-    with pytest.raises(socket.error):
+    with pytest.raises(NATSConnectionError):
         client.connect()
 
 
@@ -45,6 +50,21 @@ def test_connect_multiple_urls(nats_url):
     urls = nats_url + "," + nats_url
     with NATSClient(urls) as client:
         client.ping()
+
+
+def test_connect_rotate(nats_url, nats_invalid_url):
+    urls = nats_invalid_url + "," + nats_url
+
+    with NATSClient(urls) as client:
+        client.ping()
+
+
+def test_connect_multiple_rejected(nats_invalid_url):
+    urls = nats_invalid_url + "," + nats_invalid_url
+    client = NATSClient(urls)
+
+    with pytest.raises(NATSConnectionError):
+        client.connect()
 
 
 def test_reconnect(nats_url):
