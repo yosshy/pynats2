@@ -105,23 +105,24 @@ class NATSMessage:
 
 class NATSNoSubscribeClient:
     __slots__ = (
+        "_name",
+        "_nuid",
         "_parsed_urls",
-        "_url_index",
+        "_pedantic",
+        "_ping_interval",
+        "_socket",
+        "_socket_buffer",
+        "_socket_keepalive",
+        "_socket_timeout",
+        "_subs_queue",
+        "_ssid",
+        "_subs",
         "_tls_cacert",
         "_tls_client_cert",
         "_tls_client_key",
         "_tls_verify",
-        "_conn_options",
-        "_socket",
-        "_socket_buffer",
-        "_socket_options",
-        "_subs_queue",
-        "_ssid",
-        "_subs",
-        "_nuid",
-        "_ping_interval",
-        "_waiter",
-        "_waiter_enabled",
+        "_url_index",
+        "_verbose",
         "_vhost_name",
         "_vhost_len",
     )
@@ -141,12 +142,22 @@ class NATSNoSubscribeClient:
         socket_keepalive: bool = False,
         ping_interval: float = DEFAULT_PING_INTERVAL,
     ) -> None:
-        self._url_index: int = 0
+        self._name: str = name
+        self._nuid: NUID = NUID()
         self._parsed_urls: List[ParseResult] = []
-        self._tls_cacert = tls_cacert
-        self._tls_client_cert = tls_client_cert
-        self._tls_client_key = tls_client_key
-        self._tls_verify = tls_verify
+        self._pedantic: bool = pedantic
+        self._ping_interval: float = ping_interval
+        self._socket: socket.socket
+        self._socket_buffer: bytes = b""
+        self._socket_timeout: float = socket_timeout
+        self._socket_keepalive: bool = socket_keepalive
+        self._ssid: int = 0
+        self._tls_cacert: Optional[str] = tls_cacert
+        self._tls_client_cert: Optional[str] = tls_client_cert
+        self._tls_client_key: Optional[str] = tls_client_key
+        self._tls_verify: bool = tls_verify
+        self._url_index: int = 0
+        self._verbose: bool = verbose
 
         for _url in url.split(","):
             try:
@@ -160,30 +171,11 @@ class NATSNoSubscribeClient:
                     f"got unsupported URI scheme: %s" % parsed.scheme
                 )
 
-        self._conn_options = {
-            "name": name,
-            "lang": "python",
-            "protocol": 0,
-            "version": pkg_resources.get_distribution("pynats2").version,
-            "verbose": verbose,
-            "pedantic": pedantic,
-        }
-
         vhost: str = parsed.path.strip("/").replace("/", ".")
         if len(vhost) > 0:
             vhost += "."
         self._vhost_name: str = vhost
         self._vhost_len: int = len(vhost)
-        self._socket: socket.socket
-        self._socket_buffer: bytes = b""
-        self._socket_options = {
-            "timeout": socket_timeout,
-            "keepalive": socket_keepalive,
-        }
-
-        self._ssid = 0
-        self._nuid = NUID()
-        self._ping_interval = ping_interval
 
     def __enter__(self) -> "NATSNoSubscribeClient":
         self.connect()
@@ -207,12 +199,12 @@ class NATSNoSubscribeClient:
 
     def _send_connect_command(self) -> None:
         options = {
-            "name": self._conn_options["name"],
-            "lang": self._conn_options["lang"],
-            "protocol": self._conn_options["protocol"],
-            "version": self._conn_options["version"],
-            "verbose": self._conn_options["verbose"],
-            "pedantic": self._conn_options["pedantic"],
+            "name": self._name,
+            "lang": "python",
+            "protocol": 0,
+            "version": pkg_resources.get_distribution("pynats2").version,
+            "verbose": self._verbose,
+            "pedantic": self._pedantic,
         }
 
         username = self._parsed_urls[self._url_index].username
@@ -246,10 +238,10 @@ class NATSNoSubscribeClient:
         sock = socket.socket(family=socket.AF_INET, type=socket.SOCK_STREAM)
 
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        if self._socket_options["keepalive"]:
+        if self._socket_keepalive:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
-        sock.settimeout(self._socket_options["timeout"])
+        sock.settimeout(self._socket_timeout)
         hostname = self._parsed_urls[self._url_index].hostname
         port = self._parsed_urls[self._url_index].port
         sock.connect((hostname, port))
@@ -405,29 +397,32 @@ class NATSNoSubscribeClient:
 
 class NATSClient(NATSNoSubscribeClient):
     __slots__ = (
+        "_name",
+        "_nuid",
         "_parsed_urls",
-        "_url_index",
+        "_pedantic",
+        "_ping_interval",
+        "_pinger",
+        "_pinger_timer",
+        "_send_lock",
+        "_socket",
+        "_socket_buffer",
+        "_socket_keepalive",
+        "_socket_timeout",
+        "_ssid",
+        "_subs",
         "_tls_cacert",
         "_tls_client_cert",
         "_tls_client_key",
         "_tls_verify",
-        "_conn_options",
-        "_socket",
-        "_socket_buffer",
-        "_socket_options",
-        "_subs_queue",
-        "_send_lock",
-        "_ssid",
-        "_subs",
-        "_nuid",
-        "_ping_interval",
+        "_url_index",
         "_waiter",
         "_waiter_enabled",
+        "_workers",
+        "_worker_num",
+        "_verbose",
         "_vhost_name",
         "_vhost_len",
-        "_pinger",
-        "_pinger_timer",
-        "_workers",
     )
 
     def __init__(
@@ -460,15 +455,14 @@ class NATSClient(NATSNoSubscribeClient):
             ping_interval=ping_interval,
         )
 
-        self._conn_options["workers"] = workers
-
+        self._pinger: Optional[Thread] = None
+        self._pinger_timer: Event = Event()
         self._subs: Dict[int, NATSSubscription] = {}
         self._subs_queue: queue.Queue = queue.Queue()
         self._send_lock: RLock = RLock()
         self._waiter: Optional[Thread] = None
         self._waiter_enabled: bool = False
-        self._pinger: Optional[Thread] = None
-        self._pinger_timer: Event = Event()
+        self._worker_num: int = workers
         self._workers: Optional[ThreadPoolExecutor] = None
 
     def connect(self) -> None:
@@ -487,7 +481,7 @@ class NATSClient(NATSNoSubscribeClient):
 
     def _start_workers(self):
         self._workers = ThreadPoolExecutor(
-            max_workers=self._conn_options["workers"], thread_name_prefix="worker"
+            max_workers=self._worker_num, thread_name_prefix="worker"
         )
 
     def _start_waiter(self):
