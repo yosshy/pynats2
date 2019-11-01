@@ -70,16 +70,6 @@ COMMANDS = {
 INBOX_PREFIX = bytearray(b"_INBOX.")
 
 
-def log_exception(func):
-    def wrapper(*args, **kwargs):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            LOG.error(str(e))
-
-    return wrapper
-
-
 def auto_reconnect(func) -> Callable:
     def wrapper(self, *args, **kwargs):
         while True:
@@ -372,11 +362,6 @@ class NATSNoSubscribeClient:
             line = self._readline()
         except socket.timeout:
             return None, None
-        except ssl.SSLError:
-            return None, None
-        except socket.error as e:
-            LOG.error("_read:socket.error:%s", e)
-            return None, None
 
         command = self._get_command(line)
         if command not in commands:
@@ -506,6 +491,60 @@ class NATSClient(NATSNoSubscribeClient):
         self._worker_num: int = workers
         self._workers: Optional[ThreadPoolExecutor] = None
 
+    def _start_workers(self):
+        self._workers = ThreadPoolExecutor(
+            max_workers=self._worker_num, thread_name_prefix="worker"
+        )
+
+    def _stop_workers(self):
+        if self._workers:
+            self._workers.shutdown()
+            self._workers = None
+
+    @auto_reconnect
+    def _waiter_thread(self):
+        while self._waiter_enabled:
+            command, result = self._recv(MSG_RE, PING_RE, PONG_RE, OK_RE)
+            if command is None:
+                continue
+            if command is MSG_RE:
+                self._handle_message(result)
+            elif command is PING_RE:
+                self._send(PONG_OP)
+
+    def _start_waiter(self):
+        self._waiter = Thread(target=self._waiter_thread)
+        self._waiter_enabled = True
+        self._waiter.start()
+
+    def _stop_waiter(self):
+        if self._waiter_enabled:
+            self._waiter_enabled = False
+        try:
+            self._send(PING_OP)
+        except (socket.error, ssl.SSLError):
+            pass
+        if self._waiter:
+            self._waiter.join()
+            self._waiter = None
+
+    @auto_reconnect
+    def _pinger_thread(self) -> None:
+        while not self._pinger_timer.wait(timeout=self._ping_interval):
+            self._send(PING_OP)
+        self._pinger_timer.clear()
+
+    def _start_pinger(self):
+        self._pinger_timer.clear()
+        self._pinger = Thread(target=self._pinger_thread)
+        self._pinger.start()
+
+    def _stop_pinger(self):
+        self._pinger_timer.set()
+        if self._pinger:
+            self._pinger.join()
+            self._pinger = None
+
     def connect(self) -> None:
         super().connect()
 
@@ -522,49 +561,6 @@ class NATSClient(NATSNoSubscribeClient):
             super().close()
         except (socket.error, ssl.SSLError):
             pass
-
-    def _start_workers(self):
-        self._workers = ThreadPoolExecutor(
-            max_workers=self._worker_num, thread_name_prefix="worker"
-        )
-
-    def _start_waiter(self):
-        self._waiter = Thread(target=self._waiter_thread)
-        self._waiter_enabled = True
-        self._waiter.start()
-
-    def _start_pinger(self):
-        self._pinger_timer.clear()
-        self._pinger = Thread(target=self._pinger_thread)
-        self._pinger.start()
-
-    def _stop_workers(self):
-        if self._workers:
-            self._workers.shutdown()
-            self._workers = None
-
-    def _stop_waiter(self):
-        if self._waiter_enabled:
-            self._waiter_enabled = False
-        try:
-            self.ping()
-        except socket.error:
-            pass
-        if self._waiter:
-            self._waiter.join()
-            self._waiter = None
-
-    def _stop_pinger(self):
-        self._pinger_timer.set()
-        if self._pinger:
-            self._pinger.join()
-            self._pinger = None
-
-    @log_exception
-    def _pinger_thread(self) -> None:
-        while not self._pinger_timer.wait(timeout=self._ping_interval):
-            self._send(PING_OP)
-        self._pinger_timer.clear()
 
     def reconnect(self) -> None:
         self.close()
@@ -641,17 +637,6 @@ class NATSClient(NATSNoSubscribeClient):
     def _send(self, *parts: Union[bytes, str, int]) -> None:
         with self._send_lock:
             self._socket.sendall(_SPC_.join(self._encode(p) for p in parts) + _CRLF_)
-
-    @log_exception
-    def _waiter_thread(self):
-        while self._waiter_enabled:
-            command, result = self._recv(MSG_RE, PING_RE, PONG_RE, OK_RE)
-            if command is None:
-                continue
-            if command is MSG_RE:
-                self._handle_message(result)
-            elif command is PING_RE:
-                self._send(PONG_OP)
 
     def _handle_message(self, result: Match[bytes]) -> None:
         message_data = result.groupdict()
