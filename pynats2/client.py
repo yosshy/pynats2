@@ -139,7 +139,6 @@ class NATSNoSubscribeClient:
         "_socket_buffer",
         "_socket_keepalive",
         "_socket_timeout",
-        "_subs_queue",
         "_ssid",
         "_subs",
         "_tls_cacert",
@@ -501,7 +500,6 @@ class NATSClient(NATSNoSubscribeClient):
         self._pinger: Optional[Thread] = None
         self._pinger_timer: Event = Event()
         self._subs: Dict[int, NATSSubscription] = {}
-        self._subs_queue: queue.Queue = queue.Queue()
         self._send_lock: RLock = RLock()
         self._waiter: Optional[Thread] = None
         self._waiter_enabled: bool = False
@@ -531,7 +529,7 @@ class NATSClient(NATSNoSubscribeClient):
         )
 
     def _start_waiter(self):
-        self._waiter = Thread(target=self._waiter_thread, args=(self._subs,))
+        self._waiter = Thread(target=self._waiter_thread)
         self._waiter_enabled = True
         self._waiter.start()
 
@@ -594,18 +592,12 @@ class NATSClient(NATSNoSubscribeClient):
         self._ssid += 1
         self._subs[sub.sid] = sub
         self._send(SUB_OP, self._vhost(sub.subject), sub.queue, sub.sid)
-
-        self._stop_waiter()
-        self._start_waiter()
-
         return sub
 
     @auto_reconnect
     def unsubscribe(self, sub: NATSSubscription) -> None:
         self._subs.pop(sub.sid, None)
         self._send(UNSUB_OP, sub.sid)
-        self._stop_waiter()
-        self._start_waiter()
 
     @auto_reconnect
     def auto_unsubscribe(self, sub: NATSSubscription) -> None:
@@ -651,8 +643,7 @@ class NATSClient(NATSNoSubscribeClient):
             self._socket.sendall(_SPC_.join(self._encode(p) for p in parts) + _CRLF_)
 
     @log_exception
-    def _waiter_thread(self, subs):
-        self._subs = subs
+    def _waiter_thread(self):
         while self._waiter_enabled:
             command, result = self._recv(MSG_RE, PING_RE, PONG_RE, OK_RE)
             if command is None:
@@ -678,7 +669,10 @@ class NATSClient(NATSNoSubscribeClient):
             payload=message_payload,
         )
 
-        sub = self._subs[message.sid]
+        sub = self._subs.get(message.sid)
+        if sub is None:
+            LOG.error("no subscribe")
+            return
         sub.received_messages += 1
 
         if sub.is_wasted():
