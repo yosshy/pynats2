@@ -46,6 +46,9 @@ DEFAULT_REQUEST_TIMEOUT = 120.0
 DEFAULT_SOCKET_TIMEOUT = 1.0
 DEFAULT_WORKERS = 3
 
+RETRY_COUNT = 3
+RETRY_INTERVAL = 3
+
 INFO_RE = re.compile(rb"^INFO\s+([^\r\n]+)\r\n")
 PING_RE = re.compile(rb"^PING\r\n")
 PONG_RE = re.compile(rb"^PONG\r\n")
@@ -88,6 +91,22 @@ def auto_reconnect(func) -> Callable:
                 raise NATSConnectionError("all connection failed")
 
             sleep(self._reconnect_delay)
+
+    return wrapper
+
+
+def auto_retry(func) -> Callable:
+    def wrapper(self, *args, **kwargs):
+        while True:
+            for _ in range(RETRY_COUNT):
+                try:
+                    return func(self, *args, **kwargs)
+                except (socket.error, ssl.SSLError) as e:
+                    LOG.error(str(e))
+                    sleep(RETRY_INTERVAL)
+
+            if func.__name__ != "_pinger_thread" and not self._reconnect_forever:
+                raise NATSConnectionError("all connection failed")
 
     return wrapper
 
@@ -528,7 +547,7 @@ class NATSClient(NATSNoSubscribeClient):
             self._waiter.join()
             self._waiter = None
 
-    @auto_reconnect
+    @auto_retry
     def _pinger_thread(self) -> None:
         while not self._pinger_timer.wait(timeout=self._ping_interval):
             self._send(PING_OP)
@@ -568,7 +587,7 @@ class NATSClient(NATSNoSubscribeClient):
         for sub in self._subs.values():
             self._send(SUB_OP, self._vhost(sub.subject), sub.queue, sub.sid)
 
-    @auto_reconnect
+    @auto_retry
     def subscribe(
         self,
         subject: str,
@@ -590,25 +609,25 @@ class NATSClient(NATSNoSubscribeClient):
         self._send(SUB_OP, self._vhost(sub.subject), sub.queue, sub.sid)
         return sub
 
-    @auto_reconnect
+    @auto_retry
     def unsubscribe(self, sub: NATSSubscription) -> None:
         self._subs.pop(sub.sid, None)
         self._send(UNSUB_OP, sub.sid)
 
-    @auto_reconnect
+    @auto_retry
     def auto_unsubscribe(self, sub: NATSSubscription) -> None:
         if sub.max_messages is None:
             return
 
         self._send(UNSUB_OP, sub.sid, sub.max_messages)
 
-    @auto_reconnect
+    @auto_retry
     def publish(self, subject: str, *, payload: bytes = b"", reply: str = "") -> None:
         with self._send_lock:
             self._send(PUB_OP, self._vhost(subject), self._vhost(reply), len(payload))
             self._send(payload)
 
-    @auto_reconnect
+    @auto_retry
     def request(
         self,
         subject: str,

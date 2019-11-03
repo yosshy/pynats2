@@ -50,9 +50,6 @@ def test_connect_multiple_urls(nats_url):
     urls = nats_url + "," + nats_url
     with NATSClient(urls) as client:
         client.ping()
-        client.close()
-        time.sleep(1)
-        client.ping()
 
 
 def test_connect_rotate(nats_url, nats_invalid_url):
@@ -80,6 +77,14 @@ def test_reconnect(nats_url):
     client.ping()
 
     client.close()
+
+
+def test_auto_reconnect(nats_url):
+    urls = nats_url + "," + nats_url
+    with NATSClient(urls) as client:
+        client.close()
+        time.sleep(1)
+        client.ping()
 
 
 def test_tls_connect():
